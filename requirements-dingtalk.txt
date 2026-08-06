@@ -1,0 +1,2 @@
+# 钉钉官方 Stream SDK 的最新稳定版（2025-10-24 发布）。
+dingtalk-stream==0.24.3

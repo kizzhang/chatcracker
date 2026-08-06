@@ -1,6 +1,6 @@
 # 数据模型与证据规则
 
-## 核心数据库
+## 企业微信核心数据库
 
 | 数据库 | 表 | 用途 |
 |---|---|---|
@@ -13,6 +13,23 @@
 - 使用 `message_table.conversation_id` 关联 `conversation_table.id`。
 - 使用 `message_table.sender_id` 关联 `user_table.id`。
 - 将 `message_id` 视为证据标识符，将 `sequence` 视为会话内的排序字段。
+
+## 钉钉规范化消息库
+
+钉钉适配器将机器人实际收到的消息写入单个 `dingtalk.db`，不保存原始回调：
+
+| 表 | 用途 |
+|---|---|
+| `conversation_table` | 会话 ID、名称、会话类型、最后一条已采集消息的时间和 ID |
+| `message_table` | 本地序号、钉钉 `msgId`、会话、发送者、类型、Unix 发送时间、脱敏文本和证据摘要哈希 |
+| `user_table` | 发送者 ID 与机器人回调中提供的显示名称 |
+
+- 使用 `message_table.conversation_id` 关联 `conversation_table.id`；
+- 使用 `message_table.sender_id` 关联 `user_table.id`；
+- 将钉钉 `msgId` 视为证据标识符，并以 `dingtalk:<conversation_id>:<msgId>` 构造跨平台 `local_id`；
+- `sessionWebhook`、下载码、Client Secret 和原始回调不属于证据模型，不得持久化；
+- 图片、文件、音视频占位符只证明消息类型，不能证明附件内容已经读取；
+- 钉钉清单的 `complete:false` 表示覆盖范围仅限机器人实际收到的消息，不表示采集器写入失败。
 
 ## 时间处理
 
