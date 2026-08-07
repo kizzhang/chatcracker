@@ -15,7 +15,7 @@
 {
   "schema_version": "1",
   "source": {
-    "system": "wecom",
+    "system": "wecom | dingtalk",
     "snapshot_manifest": null,
     "snapshot_complete": null,
     "extracted_at": "ISO-8601 timestamp",
@@ -23,7 +23,7 @@
   },
   "work_items": [
     {
-      "local_id": "wecom:<conversation_id>:<message_id>",
+      "local_id": "<source_system>:<conversation_id>:<message_id>",
       "title": "简洁、以行动为导向的标题",
       "description": "结果、验收证据和相关上下文",
       "classification": "explicit_task | follow_up | completed | superseded | attachment_pending",
@@ -36,7 +36,7 @@
       "tags": [],
       "dependencies": [
         {
-          "target_local_id": "wecom:<conversation_id>:<message_id>",
+          "target_local_id": "<source_system>:<conversation_id>:<message_id>",
           "type": "blocks",
           "confidence": "high",
           "needs_confirmation": false
@@ -67,7 +67,8 @@
 
 ## 规范化规则
 
-- 使用从最有力的来源消息中派生出的稳定 `local_id`。将后续有关同一工作的消息合并到其证据中，不要创建重复条目。
+- 使用从最有力的来源消息中派生出的稳定 `local_id`。企业微信使用 `wecom:` 前缀，钉钉使用 `dingtalk:` 前缀。将后续有关同一工作的消息合并到其证据中，不要创建重复条目。
+- 对钉钉来源保留 `snapshot_complete:false`。DWS 来源说明只覆盖明确时间窗口内由钉钉返回的当前用户授权消息；Stream 来源说明只覆盖机器人实际收到的消息。不得将任一来源改写成账号完整历史。
 - `title` 采用“动作 + 结果”的形式；将讨论过程保留在 `description` 或 `evidence` 中。
 - 按用户的工作时区将日期转换为 ISO 8601。对依赖上下文或含义模糊的日期暂不解析，并设为 `needs_confirmation: true`。
 - 保留已完成、已取消和已被替代的工作以供历史追溯，但默认不要建议为其新建外部任务。

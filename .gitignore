@@ -1,3 +1,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.venv/
+
+# 本地聊天快照和消息库包含敏感数据，不得提交。
+dingtalk.db
+dingtalk.db-*
+snapshot_manifest.json
