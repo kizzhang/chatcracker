@@ -4,4 +4,4 @@ interface:
   icon_small: "./assets/icon-b-clean-wecom-128.png"
   icon_large: "./assets/icon-b-clean-wecom-256.png"
   brand_color: "#008AE8"
-  default_prompt: "使用 $wecomcracker 回顾我自己的企业微信历史或授权钉钉机器人消息，整理有证据支持的工作时间线、任务清单和项目交接预览。"
+  default_prompt: "使用 $wecomcracker 回顾我自己的企业微信历史，或通过当前用户 OAuth 授权的钉钉消息，整理有证据支持的工作时间线、任务清单和项目交接预览。"

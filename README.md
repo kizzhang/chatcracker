@@ -4,13 +4,13 @@
 
 # WeComCracker：企微工作回溯
 
-WeComCracker 是一个给 Codex 使用的工作聊天回溯 Skill。它可以从当前 Windows 用户自己的企业微信本地聊天，或明确授权的钉钉企业内部机器人实际收到的消息中，重建有证据支持的工作时间线、任务清单、决定、交付物、阻塞关系和未闭环事项，并生成可审阅的项目管理交接预览。
+WeComCracker 是一个给 Codex 使用的工作聊天回溯 Skill。它可以从当前 Windows 用户自己的企业微信本地聊天，或当前用户通过钉钉 OAuth 明确授权的消息历史中，重建有证据支持的工作时间线、任务清单、决定、交付物、阻塞关系和未闭环事项，并生成可审阅的项目管理交接预览。
 
-企业微信本地读取器只使用 Python 标准库与 Windows CNG，不依赖第三方 Python 包；当企业微信 API 或 CLI 无法提供足够长的历史记录时，可读取本机 wxSQLite3 数据库快照。钉钉实时采集器可在 Windows、macOS 和 Linux 上运行，并使用锁定版本的钉钉官方 Stream SDK。
+企业微信本地读取器只使用 Python 标准库与 Windows CNG，不依赖第三方 Python 包；当企业微信 API 或 CLI 无法提供足够长的历史记录时，可读取本机 wxSQLite3 数据库快照。钉钉历史采集器通过 DWS CLI 使用当前用户 OAuth 登录，可在 Windows、macOS 和 Linux 上运行；官方 Stream SDK 仍可作为机器人实时采集的可选路径。
 
 ## 只读取自己的授权数据
 
-企业微信路径只面向当前 Windows 用户自己的企业微信账号；钉钉路径只面向用户明确授权的企业内部机器人和应用可用范围。请勿用于读取其他人的账号、远程机器，绕过系统或企业权限，转储进程内存，或发送聊天消息。
+企业微信路径只面向当前 Windows 用户自己的企业微信账号；钉钉路径只面向当前用户亲自完成 OAuth 授权后可读取的消息，或用户明确授权的企业内部机器人。请勿用于读取其他人的账号、远程机器，绕过系统或企业权限，转储进程内存，或发送聊天消息。
 
 本版本只生成供用户审阅的工作摘要和 `not_synced` 项目交接预览，不会直接向 Vikunja、Microsoft Project 或其他项目系统写入任务。
 
@@ -65,33 +65,27 @@ python scripts/wecomcracker.py search `
   --decrypted-dir '<快照目录>' --keyword '待办' --limit 100
 ```
 
-## 钉钉：从机器人收到的新消息开始沉淀
+## 钉钉：用 DWS CLI 登录并回溯消息
 
-钉钉适配器不会回溯账号的全部历史，只保存钉钉实际投递给授权机器人的消息。群聊中机器人能收到哪些消息取决于钉钉应用配置、可用范围和群内触发方式。
-
-安装钉钉官方稳定版 Stream SDK：
+先安装可用的 DWS CLI，然后由当前用户完成钉钉 OAuth 授权。认证令牌由 DWS 自己管理，不会写入本仓库的消息库：
 
 ```bash
-python -m pip install -r requirements-dingtalk.txt
+dws auth login --recommend --format json
+python scripts/dingtalkcracker.py dws-doctor
 ```
 
-通过环境变量提供企业内部应用凭据；凭据不会写入消息库：
+按明确的 UTC+08:00 时间窗口回溯消息：
 
 ```bash
-export DINGTALK_CLIENT_ID='<Client ID>'
-export DINGTALK_CLIENT_SECRET='<Client Secret>'
-```
-
-验证应用凭据和 Stream 网络，再开始采集：
-
-```bash
-python scripts/dingtalkcracker.py doctor --live
-
-python scripts/dingtalkcracker.py collect \
+python scripts/dingtalkcracker.py collect-dws \
+  --start '2026-08-01 00:00:00' \
+  --end '2026-08-08 00:00:00' \
   --vault-dir '<钉钉消息库目录>'
 ```
 
-向机器人发送一条唯一测试短语后，在另一个终端验收：
+每页最多读取 30 条并按 `nextCursor` 翻页；只有服务端返回 `hasMore:false` 时，清单中的 `coverage.window_complete` 才为 `true`。同一时间窗口可以安全重放，消息按 `openMessageId` 幂等写入。
+
+验收消息库：
 
 ```bash
 python scripts/dingtalkcracker.py inspect \
@@ -99,10 +93,26 @@ python scripts/dingtalkcracker.py inspect \
 
 python scripts/dingtalkcracker.py search \
   --vault-dir '<钉钉消息库目录>' \
-  --keyword '<唯一测试短语>'
+  --keyword '<已知消息中的唯一短语>'
 ```
 
-`doctor --live`、SQLite `quick_check` 和唯一消息搜索全部成功，才表示真实链路跑通。完整配置、离线 JSONL 回放和安全边界见 [钉钉 Stream 采集说明](references/dingtalk-stream.md)。
+`dws-doctor`、SQLite `quick_check`、`window_complete:true` 和已知消息搜索全部成功，才表示这个时间窗口的真实链路跑通。完整登录、采集与隐私边界见 [钉钉 DWS CLI 采集说明](references/dingtalk-dws.md)。
+
+## 钉钉：可选的机器人 Stream 实时采集
+
+需要从启用后持续监听机器人收到的新消息时，安装锁定的官方 Stream SDK：
+
+```bash
+python -m pip install -r requirements-dingtalk.txt
+export DINGTALK_CLIENT_ID='<Client ID>'
+export DINGTALK_CLIENT_SECRET='<Client Secret>'
+
+python scripts/dingtalkcracker.py doctor --live
+python scripts/dingtalkcracker.py collect \
+  --vault-dir '<钉钉消息库目录>'
+```
+
+Stream 消息库与 DWS 历史消息库必须使用不同目录，避免混淆来源和覆盖范围。完整配置、离线 JSONL 回放和安全边界见 [钉钉 Stream 采集说明](references/dingtalk-stream.md)。
 
 ## 能梳理什么
 
@@ -127,12 +137,13 @@ python scripts/dingtalkcracker.py search \
 
 为兼容已经生成的快照，清单中的格式标识暂时保留为 `wecom-chat-vault-snapshot-v1`。
 
-钉钉消息库使用 `dingtalk-chat-vault-v1`，并始终标记 `complete:false` 和 `coverage.scope: messages_delivered_to_this_bot`，避免把机器人覆盖范围误当成完整历史。
+钉钉消息库使用 `dingtalk-chat-vault-v1`，并始终标记 `complete:false`。DWS 路径使用 `coverage.scope: current_user_authorized_message_history`，Stream 路径使用 `coverage.scope: messages_delivered_to_this_bot`；两者都不得表述成账号全部历史。
 
 ## Skill 入口
 
 - 主工作流：[SKILL.md](SKILL.md)
 - 安全与限制：[references/safety-and-limitations.md](references/safety-and-limitations.md)
+- 钉钉 DWS CLI 采集：[references/dingtalk-dws.md](references/dingtalk-dws.md)
 - 钉钉 Stream 采集：[references/dingtalk-stream.md](references/dingtalk-stream.md)
 - 数据模型：[references/data-model.md](references/data-model.md)
 - 任务关系：[references/task-relationships.md](references/task-relationships.md)
@@ -150,6 +161,7 @@ python scripts/dingtalkcracker.py search \
 - 默认发现非空源 WAL 时安全中止；只有用户明确接受不完整快照时才使用 `--base-only`。
 - 明文快照和提取出的聊天文本都属于敏感数据，不应提交到 GitHub。
 - 附件内容不会因为聊天中解析出文件名而自动被读取。
-- 钉钉 Client Secret 只从环境变量读取；不会写入消息库或输出。
+- DWS OAuth 令牌由 DWS 自己管理；适配器不会将令牌、OAuth 登录响应中的当前组织/用户元数据、分页游标或原始 API 响应写入消息库。作为消息证据的会话 ID 和发送者 ID 仍会保存。
+- Stream Client Secret 只从环境变量读取；不会写入消息库或输出。
 - 钉钉采集器丢弃 `sessionWebhook`、下载码与原始回调，附件只保留类型占位符。
-- 钉钉机器人没有收到的消息不在覆盖范围内；不得根据缺失消息推断工作状态。
+- DWS 只覆盖明确时间窗口内由钉钉返回的授权消息；Stream 只覆盖机器人实际收到的消息。不得根据任一路径的缺失消息推断工作状态。

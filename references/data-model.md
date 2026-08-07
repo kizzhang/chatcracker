@@ -16,20 +16,20 @@
 
 ## 钉钉规范化消息库
 
-钉钉适配器将机器人实际收到的消息写入单个 `dingtalk.db`，不保存原始回调：
+钉钉适配器将 DWS 返回的当前用户授权消息，或机器人实际收到的 Stream 消息，写入单个 `dingtalk.db`。DWS 与 Stream 必须使用不同目录，且都不保存原始响应：
 
 | 表 | 用途 |
 |---|---|
 | `conversation_table` | 会话 ID、名称、会话类型、最后一条已采集消息的时间和 ID |
-| `message_table` | 本地序号、钉钉 `msgId`、会话、发送者、类型、Unix 发送时间、脱敏文本和证据摘要哈希 |
-| `user_table` | 发送者 ID 与机器人回调中提供的显示名称 |
+| `message_table` | 本地序号、钉钉 `openMessageId`/`msgId`、会话、发送者、类型、Unix 发送时间、脱敏文本和证据摘要哈希 |
+| `user_table` | 发送者 ID 与 DWS/机器人回调提供的显示名称 |
 
 - 使用 `message_table.conversation_id` 关联 `conversation_table.id`；
 - 使用 `message_table.sender_id` 关联 `user_table.id`；
-- 将钉钉 `msgId` 视为证据标识符，并以 `dingtalk:<conversation_id>:<msgId>` 构造跨平台 `local_id`；
-- `sessionWebhook`、下载码、Client Secret 和原始回调不属于证据模型，不得持久化；
+- 将钉钉 `openMessageId` 或 `msgId` 视为证据标识符，并以 `dingtalk:<conversation_id>:<message_id>` 构造跨平台 `local_id`；
+- OAuth 令牌、OAuth 登录响应中的当前组织/用户元数据、分页游标、`sessionWebhook`、下载码、Client Secret 和原始 API/回调不属于证据模型，不得持久化；会话 ID 和发送者 ID 则属于消息证据；
 - 图片、文件、音视频占位符只证明消息类型，不能证明附件内容已经读取；
-- 钉钉清单的 `complete:false` 表示覆盖范围仅限机器人实际收到的消息，不表示采集器写入失败。
+- 钉钉清单始终为 `complete:false`。DWS 的 `coverage.window_complete:true` 只表示指定时间窗口翻页完成；Stream 的覆盖范围只限机器人实际收到的消息。两者都不表示账号全部历史完整。
 
 ## 时间处理
 

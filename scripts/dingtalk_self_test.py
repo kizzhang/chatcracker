@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import tempfile
 from types import SimpleNamespace
+from typing import Optional
 
 
 SCRIPT = Path(__file__).with_name("dingtalkcracker.py")
@@ -92,6 +93,113 @@ def fixture_records() -> list[dict[str, object]]:
         "content": {"downloadCode": "another-download-code-must-not-persist"},
     }
     return [direct_text, callback, picture]
+
+
+def dws_fixture_pages() -> list[dict[str, object]]:
+    dws_secret = "dws-secret-value-123456"
+    return [
+        {
+            "success": True,
+            "result": {
+                "conversationMessagesList": [
+                    {
+                        "openConversationId": "dws-cid-group",
+                        "singleChat": False,
+                        "title": "DWS 项目群",
+                        "messages": [
+                            {
+                                "openMessageId": "dws-msg-001",
+                                "openConversationId": "dws-cid-group",
+                                "sender": "同事丁",
+                                "senderOpenDingTalkId": "dws-sender-001",
+                                "createTime": "2026-08-07 08:00:00",
+                                "content": json.dumps(
+                                    {
+                                        "textContent": {
+                                            "text": (
+                                                "请检查 access_token=" + dws_secret
+                                            )
+                                        },
+                                        "contentType": 1,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                            {
+                                "openMessageId": "dws-msg-versioned",
+                                "openConversationId": "dws-cid-group",
+                                "sender": "同事戊",
+                                "senderOpenDingTalkId": "dws-sender-002",
+                                "createTime": "2026-08-07 07:41:02",
+                                "content": json.dumps(
+                                    {
+                                        "textContent": {"text": "[图片]旧版本"},
+                                        "contentType": 3100,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        ],
+                    }
+                ],
+                "hasMore": True,
+                "nextCursor": "opaque-cursor-2",
+            },
+        },
+        {
+            "success": True,
+            "result": {
+                "conversationMessagesList": [
+                    {
+                        "openConversationId": "dws-cid-group",
+                        "singleChat": False,
+                        "title": "DWS 项目群",
+                        "messages": [
+                            {
+                                "openMessageId": "dws-msg-versioned",
+                                "openConversationId": "dws-cid-group",
+                                "sender": "同事戊",
+                                "senderOpenDingTalkId": "dws-sender-002",
+                                "createTime": "2026-08-07 07:42:57",
+                                "content": json.dumps(
+                                    {
+                                        "textContent": {
+                                            "text": "[图片]更新版本 [图片]"
+                                        },
+                                        "contentType": 3100,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "openConversationId": "dws-cid-private",
+                        "singleChat": True,
+                        "title": "单聊",
+                        "messages": [
+                            {
+                                "openMessageId": "dws-msg-attachment",
+                                "openConversationId": "dws-cid-private",
+                                "sender": "同事己",
+                                "senderOpenDingTalkId": "dws-sender-003",
+                                "createTime": "2026-08-07 08:01:00",
+                                "content": json.dumps(
+                                    {
+                                        "attachments": [{"type": 500}],
+                                        "contentType": 500,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        ],
+                    },
+                ],
+                "hasMore": False,
+                "nextCursor": "unused-final-cursor",
+            },
+        },
+    ]
 
 
 def main() -> int:
@@ -233,6 +341,146 @@ def main() -> int:
         assert not (vault_dir / f"{vault.DATABASE_NAME}-wal").exists()
         assert not (vault_dir / f"{vault.DATABASE_NAME}-shm").exists()
         checks["readonly_queries_left_no_sidecars"] = True
+
+        dws_vault_dir = root / "dws-vault"
+        dws_pages = dws_fixture_pages()
+        dws_calls: list[list[str]] = []
+
+        def fake_run_dws_json(
+            executable: str,
+            arguments: list[str],
+            *,
+            profile: Optional[str],
+            timeout: int,
+        ) -> dict[str, object]:
+            assert Path(executable).samefile(sys.executable)
+            assert profile == "synthetic-profile"
+            assert timeout == 15
+            dws_calls.append(arguments)
+            if arguments == ["auth", "status"]:
+                return {
+                    "success": True,
+                    "authenticated": True,
+                    "token_valid": True,
+                    "refresh_token_valid": True,
+                }
+            assert arguments[:3] == ["chat", "message", "list-all"]
+            cursor = arguments[arguments.index("--cursor") + 1]
+            if cursor == "0":
+                return dws_pages[0]
+            if cursor == "opaque-cursor-2":
+                return dws_pages[1]
+            raise AssertionError(f"Unexpected cursor: {cursor}")
+
+        dws_args = Namespace(
+            dws_bin=sys.executable,
+            profile="synthetic-profile",
+            timeout=15,
+            start="2026-08-07 00:00:00",
+            end="2026-08-07 23:59:59",
+            page_size=30,
+            max_pages=10,
+            vault_dir=str(dws_vault_dir),
+        )
+        original_run_dws_json = vault._run_dws_json
+        try:
+            vault._run_dws_json = fake_run_dws_json
+            code, dws_collection = capture_json(lambda: vault.collect_dws(dws_args))
+            code2, dws_replay = capture_json(lambda: vault.collect_dws(dws_args))
+        finally:
+            vault._run_dws_json = original_run_dws_json
+        assert code == 0
+        assert code2 == 0
+        assert dws_collection["raw_messages"] == 4
+        assert dws_collection["canonical_messages"] == 3
+        assert dws_collection["inserted"] == 3
+        assert dws_collection["duplicates"] == 0
+        assert dws_collection["pages"] == 2
+        assert dws_collection["window_complete"] is True
+        assert dws_replay["inserted"] == 0
+        assert dws_replay["duplicates"] == 3
+        assert len(dws_calls) == 6
+        checks["dws_paginated_collection_and_replay"] = "3 canonical messages"
+
+        dws_manifest = json.loads(
+            (dws_vault_dir / vault.MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+        assert dws_manifest["source"]["mode"] == vault.DWS_MODE
+        assert dws_manifest["coverage"]["history_backfill"] is True
+        assert dws_manifest["coverage"]["window_complete"] is True
+        assert dws_manifest["complete"] is False
+        assert dws_manifest["oauth_tokens_persisted"] is False
+        assert dws_manifest["raw_api_responses_persisted"] is False
+
+        connection = sqlite3.connect(dws_vault_dir / vault.DATABASE_NAME)
+        try:
+            dws_contents = dict(
+                connection.execute(
+                    "SELECT message_id, content FROM message_table"
+                ).fetchall()
+            )
+        finally:
+            connection.close()
+        assert dws_contents == {
+            "dws-msg-001": "请检查 access_token:[REDACTED]",
+            "dws-msg-versioned": "[图片]更新版本 [图片]",
+            "dws-msg-attachment": "[附件]",
+        }
+        dws_database_bytes = (dws_vault_dir / vault.DATABASE_NAME).read_bytes()
+        assert b"dws-secret-value-123456" not in dws_database_bytes
+        assert b"opaque-cursor-2" not in dws_database_bytes
+        checks["dws_variants_redaction_and_no_raw_persistence"] = True
+
+        expect_error(
+            ValueError,
+            lambda: vault.ensure_vault(str(dws_vault_dir), vault.STREAM_MODE),
+        )
+        checks["dingtalk_source_modes_cannot_be_mixed"] = True
+
+        def fake_dws_doctor_json(
+            executable: str,
+            arguments: list[str],
+            *,
+            profile: Optional[str],
+            timeout: int,
+        ) -> dict[str, object]:
+            assert Path(executable).samefile(sys.executable)
+            assert profile == "synthetic-profile"
+            assert timeout == 15
+            if arguments == ["version"]:
+                return {"version": "v-test"}
+            if arguments == ["auth", "status"]:
+                return {
+                    "authenticated": True,
+                    "token_valid": True,
+                    "refresh_token_valid": True,
+                    "corp_id": "must-not-print",
+                    "user_id": "must-not-print",
+                }
+            raise AssertionError(arguments)
+
+        try:
+            vault._run_dws_json = fake_dws_doctor_json
+            code, dws_doctor = capture_json(
+                lambda: vault.dws_doctor(
+                    Namespace(
+                        dws_bin=sys.executable,
+                        profile="synthetic-profile",
+                        timeout=15,
+                    )
+                )
+            )
+        finally:
+            vault._run_dws_json = original_run_dws_json
+        assert code == 0
+        serialized_dws_doctor = json.dumps(dws_doctor)
+        assert "must-not-print" not in serialized_dws_doctor
+        assert (
+            dws_doctor["auth"]["auth_identity_metadata_persisted_in_vault"]
+            is False
+        )
+        assert dws_doctor["auth"]["oauth_tokens_persisted_in_vault"] is False
+        checks["dws_doctor_redacts_identity"] = True
 
         unsafe = root / "unsafe"
         unsafe.mkdir()

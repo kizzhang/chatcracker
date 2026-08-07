@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """DingTalk adapter for WeComCracker.
 
-Collects messages delivered to an explicitly authorized DingTalk Stream bot and
-stores only normalized evidence fields in a local SQLite vault. Credentials,
-session webhooks, download codes, and raw callback payloads are never persisted.
+Backfills the current user's authorized history through the DingTalk Workspace
+CLI, or collects messages delivered to an explicitly authorized DingTalk Stream
+bot. Only normalized evidence fields are stored in a local SQLite vault. OAuth
+tokens, app credentials, raw API responses, session webhooks, and download codes
+are never persisted.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
@@ -18,7 +20,9 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 from typing import Iterable, Optional
@@ -30,6 +34,11 @@ MANIFEST_FORMAT = "dingtalk-chat-vault-v1"
 SDK_DISTRIBUTION = "dingtalk-stream"
 SDK_VERSION = "0.24.3"
 STREAM_TOPIC = "/v1.0/im/bot/messages/get"
+STREAM_MODE = "bot_stream"
+DWS_MODE = "dws_user_oauth"
+DWS_DEFAULT_EXECUTABLE = "dws"
+DWS_MAX_PAGE_SIZE = 30
+DWS_TIMEZONE = timezone(timedelta(hours=8))
 CLIENT_ID_ENV = "DINGTALK_CLIENT_ID"
 CLIENT_SECRET_ENV = "DINGTALK_CLIENT_SECRET"
 DATABASE_NAME = "dingtalk.db"
@@ -84,6 +93,48 @@ class NormalizedMessage:
     send_time: int
     content: str
     source_digest: str
+
+
+def _normalized_message(
+    *,
+    message_id: str,
+    conversation_id: str,
+    conversation_name: str,
+    conversation_type: str,
+    sender_id: str,
+    sender_name: str,
+    content_type: str,
+    send_time: int,
+    content: str,
+) -> NormalizedMessage:
+    digest_source = {
+        "message_id": message_id,
+        "conversation_id": conversation_id,
+        "sender_id": sender_id,
+        "content_type": content_type,
+        "send_time": send_time,
+        "content": content,
+    }
+    source_digest = hashlib.sha256(
+        json.dumps(
+            digest_source,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return NormalizedMessage(
+        message_id=message_id,
+        conversation_id=conversation_id,
+        conversation_name=conversation_name,
+        conversation_type=conversation_type,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        content_type=content_type,
+        send_time=send_time,
+        content=content,
+        source_digest=source_digest,
+    )
 
 
 def _utc_now() -> str:
@@ -198,24 +249,7 @@ def normalize_dingtalk_message(payload: dict[str, object]) -> NormalizedMessage:
     send_time = _normalize_timestamp(payload.get("createAt"))
     content = _message_content(payload, content_type)
 
-    digest_source = {
-        "message_id": message_id,
-        "conversation_id": conversation_id,
-        "sender_id": sender_id,
-        "content_type": content_type,
-        "send_time": send_time,
-        "content": content,
-    }
-    source_digest = hashlib.sha256(
-        json.dumps(
-            digest_source,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-
-    return NormalizedMessage(
+    return _normalized_message(
         message_id=message_id,
         conversation_id=conversation_id,
         conversation_name=conversation_name,
@@ -225,8 +259,195 @@ def normalize_dingtalk_message(payload: dict[str, object]) -> NormalizedMessage:
         content_type=content_type,
         send_time=send_time,
         content=content,
-        source_digest=source_digest,
     )
+
+
+def _parse_dws_timestamp(value: object) -> int:
+    if isinstance(value, (int, float)):
+        return _normalize_timestamp(value)
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("DWS 消息缺少 createTime")
+    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, pattern).replace(tzinfo=DWS_TIMEZONE)
+        except ValueError:
+            continue
+        return int(parsed.timestamp())
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise ValueError(f"DWS 消息 createTime 格式不受支持：{text!r}") from error
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=DWS_TIMEZONE)
+    return int(parsed.timestamp())
+
+
+def _dws_content(raw_content: object, content_type: object) -> str:
+    content: object = raw_content
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            return _redact_text(content) or f"[钉钉消息 {content_type or 'unknown'}]"
+
+    if isinstance(content, dict):
+        for container_name in (
+            "textContent",
+            "markdownContent",
+            "richTextContent",
+        ):
+            container = content.get(container_name)
+            if not isinstance(container, dict):
+                continue
+            for field_name in ("text", "content", "title"):
+                cleaned = _redact_text(container.get(field_name))
+                if cleaned:
+                    return cleaned
+
+        for field_name in ("text", "content", "title", "fileName"):
+            value = content.get(field_name)
+            if isinstance(value, (str, int, float)):
+                cleaned = _redact_text(value)
+                if cleaned:
+                    return cleaned
+
+        attachments = content.get("attachments")
+        if isinstance(attachments, list) and attachments:
+            return "[附件]"
+
+    return f"[钉钉消息 {content_type or 'unknown'}]"
+
+
+def normalize_dws_message(
+    message: dict[str, object], conversation: dict[str, object]
+) -> NormalizedMessage:
+    if not isinstance(message, dict) or not isinstance(conversation, dict):
+        raise TypeError("DWS 会话和消息必须是 JSON 对象")
+
+    message_id = str(
+        message.get("openMessageId") or message.get("openMsgId") or ""
+    ).strip()
+    if not message_id:
+        raise ValueError("DWS 消息缺少 openMessageId")
+
+    conversation_id = str(
+        message.get("openConversationId")
+        or conversation.get("openConversationId")
+        or ""
+    ).strip()
+    if not conversation_id:
+        raise ValueError(f"DWS 消息 {message_id} 缺少 openConversationId")
+
+    sender_id = str(
+        message.get("senderOpenDingTalkId")
+        or message.get("senderOpenDingtalkId")
+        or ""
+    ).strip()
+    if not sender_id:
+        raise ValueError(f"DWS 消息 {message_id} 缺少 senderOpenDingTalkId")
+
+    sender_name = _redact_text(message.get("sender") or sender_id) or sender_id
+    single_chat = conversation.get("singleChat")
+    conversation_type = "1" if single_chat is True else "2"
+    default_name = sender_name if conversation_type == "1" else conversation_id
+    conversation_name = _redact_text(conversation.get("title") or default_name)
+    content_type_value: object = "unknown"
+    raw_content = message.get("content")
+    if isinstance(raw_content, str):
+        try:
+            decoded_content = json.loads(raw_content)
+        except json.JSONDecodeError:
+            decoded_content = None
+    else:
+        decoded_content = raw_content
+    if isinstance(decoded_content, dict):
+        content_type_value = decoded_content.get("contentType") or "unknown"
+    content_type = f"dws:{content_type_value}"
+    send_time = _parse_dws_timestamp(message.get("createTime"))
+    content = _dws_content(raw_content, content_type_value)
+
+    return _normalized_message(
+        message_id=message_id,
+        conversation_id=conversation_id,
+        conversation_name=conversation_name or default_name,
+        conversation_type=conversation_type,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        content_type=content_type,
+        send_time=send_time,
+        content=content,
+    )
+
+
+def _prefer_dws_message(
+    current: NormalizedMessage, candidate: NormalizedMessage
+) -> NormalizedMessage:
+    """Choose the newest, richest rendering of one DWS message ID."""
+
+    current_rank = (current.send_time, len(current.content), current.source_digest)
+    candidate_rank = (
+        candidate.send_time,
+        len(candidate.content),
+        candidate.source_digest,
+    )
+    return candidate if candidate_rank > current_rank else current
+
+
+def normalize_dws_response(
+    response: dict[str, object],
+) -> tuple[list[NormalizedMessage], dict[str, object]]:
+    if response.get("success") is not True:
+        detail = (
+            response.get("friendly_hint")
+            or response.get("message")
+            or response.get("error")
+            or "DWS 消息接口未返回 success:true"
+        )
+        raise RuntimeError(_redact_text(detail))
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise ValueError("DWS 消息响应缺少 result 对象")
+    conversations = result.get("conversationMessagesList")
+    if conversations is None:
+        conversations = []
+    if not isinstance(conversations, list):
+        raise ValueError("DWS result.conversationMessagesList 必须是数组")
+
+    canonical: dict[str, NormalizedMessage] = {}
+    raw_count = 0
+    for conversation in conversations:
+        if not isinstance(conversation, dict):
+            raise ValueError("DWS 会话项必须是 JSON 对象")
+        messages = conversation.get("messages") or []
+        if not isinstance(messages, list):
+            raise ValueError("DWS 会话 messages 必须是数组")
+        for raw_message in messages:
+            if not isinstance(raw_message, dict):
+                raise ValueError("DWS 消息项必须是 JSON 对象")
+            raw_count += 1
+            normalized = normalize_dws_message(raw_message, conversation)
+            existing = canonical.get(normalized.message_id)
+            canonical[normalized.message_id] = (
+                normalized
+                if existing is None
+                else _prefer_dws_message(existing, normalized)
+            )
+
+    messages = sorted(
+        canonical.values(),
+        key=lambda item: (item.send_time, item.conversation_id, item.message_id),
+    )
+    has_more = result.get("hasMore") is True
+    next_cursor = result.get("nextCursor")
+    if has_more and not str(next_cursor or "").strip():
+        raise ValueError("DWS 响应 hasMore:true 但缺少 nextCursor")
+    return messages, {
+        "raw_count": raw_count,
+        "canonical_count": len(messages),
+        "has_more": has_more,
+        "next_cursor": str(next_cursor or ""),
+    }
 
 
 def _connect_writable(path: Path) -> sqlite3.Connection:
@@ -265,27 +486,56 @@ def _write_json_atomic(path: Path, value: dict[str, object]) -> None:
             temporary.unlink()
 
 
-def _initial_manifest() -> dict[str, object]:
+def _source_manifest(source_mode: str) -> tuple[dict[str, object], dict[str, object]]:
+    if source_mode == STREAM_MODE:
+        return (
+            {
+                "system": "dingtalk",
+                "mode": STREAM_MODE,
+                "topic": STREAM_TOPIC,
+            },
+            {
+                "scope": "messages_delivered_to_this_bot",
+                "history_backfill": False,
+                "warning": (
+                    "仅包含钉钉实际投递给此机器人的消息；不代表账号或群聊的全部历史"
+                ),
+            },
+        )
+    if source_mode == DWS_MODE:
+        return (
+            {
+                "system": "dingtalk",
+                "mode": DWS_MODE,
+                "command": "dws chat message list-all",
+            },
+            {
+                "scope": "current_user_authorized_message_history",
+                "history_backfill": True,
+                "window_complete": False,
+                "warning": (
+                    "仅包含当前用户授权后、钉钉在明确时间窗口内返回的消息；"
+                    "不代表账号全部历史或不可见会话"
+                ),
+            },
+        )
+    raise ValueError(f"不支持的钉钉消息库来源模式：{source_mode}")
+
+
+def _initial_manifest(source_mode: str = STREAM_MODE) -> dict[str, object]:
     created = _utc_now()
+    source, coverage = _source_manifest(source_mode)
     return {
         "format": MANIFEST_FORMAT,
-        "source": {
-            "system": "dingtalk",
-            "mode": "bot_stream",
-            "topic": STREAM_TOPIC,
-        },
+        "source": source,
         "created_utc": created,
         "updated_utc": created,
         "complete": False,
-        "coverage": {
-            "scope": "messages_delivered_to_this_bot",
-            "history_backfill": False,
-            "warning": (
-                "仅包含钉钉实际投递给此机器人的消息；不代表账号或群聊的全部历史"
-            ),
-        },
+        "coverage": coverage,
         "credentials_persisted": False,
+        "oauth_tokens_persisted": False,
         "raw_callbacks_persisted": False,
+        "raw_api_responses_persisted": False,
         "sdk": {"distribution": SDK_DISTRIBUTION, "tested_version": SDK_VERSION},
         "message_count": 0,
         "conversation_count": 0,
@@ -295,7 +545,7 @@ def _initial_manifest() -> dict[str, object]:
     }
 
 
-def _initialize_vault(directory: Path) -> None:
+def _initialize_vault(directory: Path, source_mode: str) -> None:
     directory.mkdir(parents=True, exist_ok=False)
     try:
         os.chmod(directory, 0o700)
@@ -311,10 +561,10 @@ def _initialize_vault(directory: Path) -> None:
         os.chmod(directory / DATABASE_NAME, 0o600)
     except OSError:
         pass
-    _write_json_atomic(directory / MANIFEST_NAME, _initial_manifest())
+    _write_json_atomic(directory / MANIFEST_NAME, _initial_manifest(source_mode))
 
 
-def _validate_vault(directory: Path) -> None:
+def _validate_vault(directory: Path, expected_mode: Optional[str] = None) -> None:
     manifest_path = directory / MANIFEST_NAME
     database_path = directory / DATABASE_NAME
     if not manifest_path.is_file() or not database_path.is_file():
@@ -328,9 +578,14 @@ def _validate_vault(directory: Path) -> None:
     source = manifest.get("source")
     if not isinstance(source, dict) or source.get("system") != "dingtalk":
         raise ValueError("消息库来源不是 dingtalk")
+    if expected_mode is not None and source.get("mode") != expected_mode:
+        raise ValueError(
+            "拒绝混用钉钉消息库来源："
+            f"已有 {source.get('mode')!r}，本次为 {expected_mode!r}"
+        )
 
 
-def ensure_vault(path_value: str) -> Path:
+def ensure_vault(path_value: str, source_mode: str = STREAM_MODE) -> Path:
     requested = Path(path_value).expanduser()
     if requested.is_symlink():
         raise ValueError("拒绝将符号链接作为钉钉消息库目录")
@@ -340,23 +595,27 @@ def ensure_vault(path_value: str) -> Path:
             raise NotADirectoryError(directory)
         if not any(directory.iterdir()):
             directory.rmdir()
-            _initialize_vault(directory)
+            _initialize_vault(directory, source_mode)
         else:
-            _validate_vault(directory)
+            _validate_vault(directory, source_mode)
     else:
         directory.parent.mkdir(parents=True, exist_ok=True)
-        _initialize_vault(directory)
+        _initialize_vault(directory, source_mode)
     return directory
 
 
 class VaultWriter:
-    def __init__(self, directory: Path) -> None:
-        _validate_vault(directory)
+    def __init__(
+        self, directory: Path, expected_mode: Optional[str] = None
+    ) -> None:
+        _validate_vault(directory, expected_mode)
         self.directory = directory
         self.connection = _connect_writable(directory / DATABASE_NAME)
 
     def ingest(self, payload: dict[str, object]) -> bool:
-        message = normalize_dingtalk_message(payload)
+        return self.ingest_message(normalize_dingtalk_message(payload))
+
+    def ingest_message(self, message: NormalizedMessage) -> bool:
         existing = self.connection.execute(
             "SELECT source_digest FROM message_table WHERE message_id = ?",
             (message.message_id,),
@@ -464,15 +723,17 @@ def _refresh_manifest(directory: Path) -> dict[str, object]:
 def _snapshot_status(directory: Path) -> dict[str, object]:
     _validate_vault(directory)
     manifest = json.loads((directory / MANIFEST_NAME).read_text(encoding="utf-8"))
+    coverage = manifest.get("coverage")
+    warning = coverage.get("warning") if isinstance(coverage, dict) else None
     return {
         "format": manifest.get("format"),
         "source": manifest.get("source"),
         "complete": False,
-        "coverage": manifest.get("coverage"),
+        "coverage": coverage,
         "created_utc": manifest.get("created_utc"),
         "updated_utc": manifest.get("updated_utc"),
         "message_count": manifest.get("message_count"),
-        "warning": "钉钉消息库只覆盖实际投递给此机器人的消息",
+        "warning": warning,
     }
 
 
@@ -515,8 +776,8 @@ def import_jsonl(args: argparse.Namespace) -> int:
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
-    directory = ensure_vault(args.vault_dir)
-    writer = VaultWriter(directory)
+    directory = ensure_vault(args.vault_dir, STREAM_MODE)
+    writer = VaultWriter(directory, STREAM_MODE)
     inserted = 0
     duplicates = 0
     try:
@@ -550,6 +811,252 @@ def import_jsonl(args: argparse.Namespace) -> int:
                 "manifest": str(directory / MANIFEST_NAME),
                 "complete": False,
                 "coverage": "messages_delivered_to_this_bot",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _resolve_dws_executable(requested: str) -> str:
+    candidate = requested.strip()
+    if not candidate:
+        raise ValueError("DWS CLI 路径不能为空")
+    if os.path.sep in candidate or (os.path.altsep and os.path.altsep in candidate):
+        path = Path(candidate).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        if not os.access(path, os.X_OK):
+            raise PermissionError(f"DWS CLI 不可执行：{path}")
+        return str(path)
+    resolved = shutil.which(candidate)
+    if not resolved:
+        raise FileNotFoundError(f"PATH 中找不到 DWS CLI：{candidate}")
+    return resolved
+
+
+def _run_dws_json(
+    executable: str,
+    arguments: list[str],
+    *,
+    profile: Optional[str],
+    timeout: int,
+) -> dict[str, object]:
+    command = [executable, *arguments]
+    if profile:
+        command.extend(["--profile", profile])
+    command.extend(["--format", "json"])
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError(f"DWS 命令超过 {timeout} 秒未完成") from error
+    if completed.returncode != 0:
+        detail = _redact_text(completed.stderr or completed.stdout)
+        raise RuntimeError(
+            f"DWS 命令失败（退出码 {completed.returncode}）：{detail or '无错误详情'}"
+        )
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("DWS 命令没有返回有效 JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("DWS 命令返回值必须是 JSON 对象")
+    return value
+
+
+def dws_doctor(args: argparse.Namespace) -> int:
+    executable = _resolve_dws_executable(args.dws_bin)
+    version = _run_dws_json(
+        executable,
+        ["version"],
+        profile=args.profile,
+        timeout=args.timeout,
+    )
+    auth = _run_dws_json(
+        executable,
+        ["auth", "status"],
+        profile=args.profile,
+        timeout=args.timeout,
+    )
+    authenticated = auth.get("authenticated") is True
+    token_valid = auth.get("token_valid") is True
+    result = {
+        "success": authenticated and token_valid,
+        "source": "dingtalk",
+        "mode": DWS_MODE,
+        "dws": {
+            "path": executable,
+            "version": version.get("version"),
+        },
+        "auth": {
+            "authenticated": authenticated,
+            "token_valid": token_valid,
+            "refresh_token_valid": auth.get("refresh_token_valid") is True,
+            "auth_identity_metadata_persisted_in_vault": False,
+            "oauth_tokens_persisted_in_vault": False,
+        },
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["success"] else 1
+
+
+def _update_dws_manifest(
+    directory: Path,
+    *,
+    start: str,
+    end: str,
+    page_count: int,
+    raw_count: int,
+    canonical_count: int,
+    inserted: int,
+    duplicates: int,
+    window_complete: bool,
+) -> None:
+    manifest_path = directory / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    coverage = manifest.get("coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError("钉钉消息库 coverage 无效")
+    coverage.update(
+        {
+            "history_backfill": True,
+            "window_complete": window_complete,
+            "last_window": {
+                "start": start,
+                "end": end,
+                "timezone": "UTC+08:00",
+                "pages": page_count,
+                "raw_message_count": raw_count,
+                "canonical_message_count": canonical_count,
+                "inserted": inserted,
+                "duplicates": duplicates,
+                "collected_utc": _utc_now(),
+            },
+        }
+    )
+    manifest["coverage"] = coverage
+    _write_json_atomic(manifest_path, manifest)
+
+
+def collect_dws(args: argparse.Namespace) -> int:
+    executable = _resolve_dws_executable(args.dws_bin)
+    start_time = datetime.strptime(args.start, "%Y-%m-%d %H:%M:%S")
+    end_time = datetime.strptime(args.end, "%Y-%m-%d %H:%M:%S")
+    if end_time <= start_time:
+        raise ValueError("--end 必须晚于 --start")
+
+    auth = _run_dws_json(
+        executable,
+        ["auth", "status"],
+        profile=args.profile,
+        timeout=args.timeout,
+    )
+    if auth.get("authenticated") is not True or auth.get("token_valid") is not True:
+        raise RuntimeError("DWS 尚未登录或令牌无效；请先运行 dws auth login --recommend")
+
+    cursor = "0"
+    seen_cursors: set[str] = set()
+    canonical: dict[str, NormalizedMessage] = {}
+    raw_count = 0
+    page_count = 0
+    window_complete = False
+    while page_count < args.max_pages:
+        if cursor in seen_cursors:
+            raise RuntimeError("DWS 分页游标重复，已停止以避免无限循环")
+        seen_cursors.add(cursor)
+        response = _run_dws_json(
+            executable,
+            [
+                "chat",
+                "message",
+                "list-all",
+                "--start",
+                args.start,
+                "--end",
+                args.end,
+                "--limit",
+                str(args.page_size),
+                "--cursor",
+                cursor,
+            ],
+            profile=args.profile,
+            timeout=args.timeout,
+        )
+        page_messages, page = normalize_dws_response(response)
+        page_count += 1
+        raw_count += int(page["raw_count"])
+        for message in page_messages:
+            existing = canonical.get(message.message_id)
+            canonical[message.message_id] = (
+                message
+                if existing is None
+                else _prefer_dws_message(existing, message)
+            )
+        if page["has_more"] is not True:
+            window_complete = True
+            break
+        cursor = str(page["next_cursor"])
+
+    messages = sorted(
+        canonical.values(),
+        key=lambda item: (item.send_time, item.conversation_id, item.message_id),
+    )
+    directory = ensure_vault(args.vault_dir, DWS_MODE)
+    writer = VaultWriter(directory, DWS_MODE)
+    inserted = 0
+    duplicates = 0
+    try:
+        for message in messages:
+            if writer.ingest_message(message):
+                inserted += 1
+            else:
+                duplicates += 1
+        writer.commit()
+    except Exception:
+        writer.rollback()
+        raise
+    finally:
+        writer.close()
+
+    _update_dws_manifest(
+        directory,
+        start=args.start,
+        end=args.end,
+        page_count=page_count,
+        raw_count=raw_count,
+        canonical_count=len(messages),
+        inserted=inserted,
+        duplicates=duplicates,
+        window_complete=window_complete,
+    )
+    manifest = _refresh_manifest(directory)
+    print(
+        json.dumps(
+            {
+                "success": True,
+                "source": "dingtalk",
+                "mode": DWS_MODE,
+                "inserted": inserted,
+                "duplicates": duplicates,
+                "raw_messages": raw_count,
+                "canonical_messages": len(messages),
+                "pages": page_count,
+                "window_complete": window_complete,
+                "message_count": manifest["message_count"],
+                "vault_dir": str(directory),
+                "manifest": str(directory / MANIFEST_NAME),
+                "complete": False,
+                "coverage": "current_user_authorized_message_history",
+                "oauth_tokens_persisted": False,
+                "raw_api_responses_persisted": False,
             },
             ensure_ascii=False,
             indent=2,
@@ -654,8 +1161,8 @@ def build_stream_handler(sdk, writer: VaultWriter, directory: Path):
 def collect_stream(args: argparse.Namespace) -> int:
     sdk = _load_sdk()
     client_id, client_secret = _credentials()
-    directory = ensure_vault(args.vault_dir)
-    writer = VaultWriter(directory)
+    directory = ensure_vault(args.vault_dir, STREAM_MODE)
+    writer = VaultWriter(directory, STREAM_MODE)
     try:
         credential = sdk.Credential(client_id, client_secret)
         client = sdk.DingTalkStreamClient(credential)
@@ -880,6 +1387,10 @@ def nonnegative_int(value: str) -> int:
     return parsed
 
 
+def dws_page_size(value: str) -> int:
+    return bounded_positive_int(value, DWS_MAX_PAGE_SIZE)
+
+
 class ChineseArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs) -> None:
         kwargs["add_help"] = False
@@ -903,8 +1414,8 @@ def _add_query_time_arguments(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(
         description=(
-            "DingTalkCracker：通过钉钉官方 Stream SDK 采集明确授权机器人实际收到的消息，"
-            "并保存为本地证据库。"
+            "DingTalkCracker：通过 DWS CLI 回溯当前用户授权的钉钉消息，或通过"
+            "钉钉官方 Stream SDK 采集机器人实际收到的消息，并保存为本地证据库。"
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -914,6 +1425,55 @@ def build_parser() -> argparse.ArgumentParser:
         "--live", action="store_true", help="使用环境变量中的凭据验证 Stream 连接票据"
     )
     doctor_parser.set_defaults(handler=doctor)
+
+    dws_doctor_parser = subparsers.add_parser(
+        "dws-doctor", help="检查 DWS CLI 与当前用户 OAuth 登录态"
+    )
+    dws_doctor_parser.add_argument(
+        "--dws-bin", default=DWS_DEFAULT_EXECUTABLE, help="DWS CLI 命令或绝对路径"
+    )
+    dws_doctor_parser.add_argument(
+        "--profile", help="可选：DWS 组织 profile 名或 corpId"
+    )
+    dws_doctor_parser.add_argument(
+        "--timeout", type=bounded_positive_int, default=60, help="单条 DWS 命令超时秒数"
+    )
+    dws_doctor_parser.set_defaults(handler=dws_doctor)
+
+    dws_collect_parser = subparsers.add_parser(
+        "collect-dws", help="通过当前用户的 DWS OAuth 登录回溯消息历史"
+    )
+    dws_collect_parser.add_argument(
+        "--vault-dir", required=True, help="钉钉本地消息库目录"
+    )
+    dws_collect_parser.add_argument(
+        "--start", required=True, help="起始时间：YYYY-MM-DD HH:MM:SS（UTC+08:00）"
+    )
+    dws_collect_parser.add_argument(
+        "--end", required=True, help="结束时间：YYYY-MM-DD HH:MM:SS（UTC+08:00）"
+    )
+    dws_collect_parser.add_argument(
+        "--page-size",
+        type=dws_page_size,
+        default=DWS_MAX_PAGE_SIZE,
+        help=f"每页消息数（默认及最大：{DWS_MAX_PAGE_SIZE}）",
+    )
+    dws_collect_parser.add_argument(
+        "--max-pages",
+        type=bounded_positive_int,
+        default=100,
+        help="最多拉取页数（默认：100；达到上限会标记窗口不完整）",
+    )
+    dws_collect_parser.add_argument(
+        "--dws-bin", default=DWS_DEFAULT_EXECUTABLE, help="DWS CLI 命令或绝对路径"
+    )
+    dws_collect_parser.add_argument(
+        "--profile", help="可选：DWS 组织 profile 名或 corpId"
+    )
+    dws_collect_parser.add_argument(
+        "--timeout", type=bounded_positive_int, default=60, help="单条 DWS 命令超时秒数"
+    )
+    dws_collect_parser.set_defaults(handler=collect_dws)
 
     collect_parser = subparsers.add_parser("collect", help="持续采集钉钉机器人收到的消息")
     collect_parser.add_argument("--vault-dir", required=True, help="钉钉本地消息库目录")

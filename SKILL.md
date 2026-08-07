@@ -1,17 +1,17 @@
 ---
 name: wecomcracker
-description: "从当前用户自己且明确授权的企业微信或钉钉消息中重建个人工作历史：整理有证据支持的时间线，找回任务与承诺，识别决定、期限、交付物、阻塞、依赖、已完成事项和未闭环跟进，并生成可审阅的项目管理交接预览。企业微信本地快照仅支持 Windows；钉钉通过官方 Stream SDK 采集实际投递给授权机器人的消息。不得用于其他人的账号、绕过系统或企业权限、发送消息，或把推断出的任务直接写入外部项目系统。"
+description: "从当前用户自己且明确授权的企业微信或钉钉消息中重建个人工作历史：整理有证据支持的时间线，找回任务与承诺，识别决定、期限、交付物、阻塞、依赖、已完成事项和未闭环跟进，并生成可审阅的项目管理交接预览。企业微信本地快照仅支持 Windows；钉钉优先通过 DWS CLI 和当前用户 OAuth 回溯明确时间窗口，也可通过官方 Stream SDK 采集机器人实时消息。不得用于其他人的账号、绕过系统或企业权限、发送消息，或把推断出的任务直接写入外部项目系统。"
 ---
 
 # WeComCracker：企微工作回溯
 
-使用 WeComCracker 把用户自己的企业微信历史对话或授权钉钉机器人实际收到的消息整理成可靠的个人工作记忆：谁提出了什么、承诺了什么、做了什么决定、交付了什么、被什么阻塞、哪些要求已被替代，以及哪些事项尚未闭环。确保每个结论都能追溯到聊天记录或用户明确授权读取的文件证据。
+使用 WeComCracker 把用户自己的企业微信历史对话、当前用户 OAuth 授权的钉钉消息历史，或授权钉钉机器人实际收到的消息整理成可靠的个人工作记忆：谁提出了什么、承诺了什么、做了什么决定、交付了什么、被什么阻塞、哪些要求已被替代，以及哪些事项尚未闭环。确保每个结论都能追溯到聊天记录或用户明确授权读取的文件证据。
 
 本版本只生成供用户审阅的工作摘要和项目交接预览。不要仅凭本 Skill 在 Vikunja、Microsoft Project 或其他外部系统中创建或更新事项。
 
 企业微信本地数据使用 `scripts/wecomcracker.py`。该脚本只导入 Python 标准库，并调用 Windows `kernel32.dll` 和 `bcrypt.dll`。旧命令名 `scripts/wecom_chat_vault.py` 仅作为兼容入口保留。
 
-钉钉使用 `scripts/dingtalkcracker.py`，仅实时连接时依赖钉钉官方 `dingtalk-stream` SDK。该适配器不发送或回复消息，只把机器人实际收到的规范化证据写入本地 SQLite 消息库。
+钉钉使用 `scripts/dingtalkcracker.py`。DWS 路径调用本机 `dws`，使用当前用户已完成的 OAuth 登录回溯消息；仅 Stream 实时路径依赖钉钉官方 `dingtalk-stream` SDK。两条路径都不发送或回复消息，只把规范化证据写入本地 SQLite 消息库。
 
 ## 安全边界
 
@@ -23,18 +23,20 @@ description: "从当前用户自己且明确授权的企业微信或钉钉消息
 - 不要禁用终端安全软件、提升到其他 Windows 会话，或更改文件系统权限。
 - 将明文快照和提取出的聊天文本视为敏感数据。
 - 企业微信解密始终选择全新的输出目录；脚本会拒绝已有路径和局部替换。钉钉消息库可以在通过清单校验后继续追加。
+- DWS OAuth 令牌由 DWS 自己管理；适配器不得保存令牌、OAuth 登录响应中的当前组织/用户元数据、分页游标或原始 API 响应。作为证据的会话 ID 和发送者 ID 可以保留。
 - 钉钉 Client Secret 只通过环境变量读取；不要写入命令参数、仓库、消息库或日志。
-- 钉钉适配器不得保存 `sessionWebhook`、下载码或原始回调，不得将机器人覆盖范围表述为账号的完整历史。
+- 钉钉适配器不得保存 `sessionWebhook`、下载码或原始回调。DWS 和 Stream 必须使用不同消息库目录，且任一覆盖范围都不得表述为账号的完整历史。
 
 解密前，或者需要判断时效性、WAL、隐私与附件完整性时，先阅读 [references/safety-and-limitations.md](references/safety-and-limitations.md)。
 
 ## 0. 选择数据源
 
 - 当前 Windows 用户自己的企业微信本地历史：执行第 1 至 3 节；
-- 明确授权的钉钉企业内部机器人从启用后收到的消息：执行第 3A 节；
+- 当前用户通过 DWS OAuth 授权后回溯钉钉消息：执行第 3A 节；
+- 明确授权的钉钉企业内部机器人从启用后收到的消息：执行第 3B 节；
 - 两种来源都存在时，分别建立快照或消息库，再在梳理结果时保留来源系统和原始消息 ID。
 
-钉钉机器人覆盖范围与企业微信本地快照不同。不要使用钉钉消息库中的缺失记录否定其他会话中可能存在的工作。
+钉钉 DWS 时间窗口、机器人覆盖范围与企业微信本地快照都不同。不要使用任一消息库中的缺失记录否定其他会话中可能存在的工作。
 
 ## 1. 企业微信：定位当前账号
 
@@ -98,28 +100,29 @@ python scripts/wecomcracker.py search `
 
 需要关联会话、发送者、消息或附件元数据，或者要把聊天转换为有证据支持的任务时，阅读 [references/data-model.md](references/data-model.md)。
 
-## 3A. 钉钉：建立并查询消息库
+## 3A. 钉钉：用 DWS OAuth 回溯消息
 
-先阅读 [references/dingtalk-stream.md](references/dingtalk-stream.md)，确认机器人可用范围和历史覆盖边界。安装锁定的官方稳定版 SDK：
+先完整阅读 [references/dingtalk-dws.md](references/dingtalk-dws.md)。确认本机有 DWS CLI，再由当前用户完成 OAuth 登录：
 
 ```bash
-python -m pip install -r requirements-dingtalk.txt
+dws auth login --recommend --format json
+python scripts/dingtalkcracker.py dws-doctor
 ```
 
-通过环境变量提供应用凭据，然后验证真实连接：
+按明确时间窗口建立消息库：
 
 ```bash
-python scripts/dingtalkcracker.py doctor --live
-```
-
-开始持续采集：
-
-```bash
-python scripts/dingtalkcracker.py collect \
+python scripts/dingtalkcracker.py collect-dws \
+  --start '2026-08-01 00:00:00' \
+  --end '2026-08-08 00:00:00' \
   --vault-dir '<钉钉消息库目录>'
 ```
 
-查询会话和消息：
+只有当 `dws-doctor` 成功、`collect-dws` 成功、`coverage.window_complete:true`、`inspect` 的 `quick_check` 为 `ok`，且 `search` 能返回窗口内已知消息的 ID、发送者和时间戳时，才可声明该时间窗口的真实链路已经跑通。若达到 `--max-pages`，必须明确标注窗口不完整。
+
+清单始终保持 `complete:false`：`window_complete:true` 只说明明确时间窗口已经翻页到 `hasMore:false`，不代表账号全部历史。
+
+查询命令对 DWS 和 Stream 消息库通用：
 
 ```bash
 python scripts/dingtalkcracker.py inspect --vault-dir '<钉钉消息库目录>'
@@ -130,9 +133,20 @@ python scripts/dingtalkcracker.py search \
   --vault-dir '<钉钉消息库目录>' --keyword '待办' --limit 100
 ```
 
-只有当 `doctor --live` 成功、用户向机器人发送的唯一测试短语被采集、`inspect` 的 `quick_check` 为 `ok`，且 `search` 能返回该消息的 ID、发送者和时间戳时，才可声明钉钉真实链路已经跑通。
+## 3B. 钉钉：可选的机器人 Stream 实时采集
 
-无论采集了多少消息，钉钉清单都保持 `complete:false`，因为它只覆盖机器人实际收到的消息，不代表账号或群聊的全部历史。
+先完整阅读 [references/dingtalk-stream.md](references/dingtalk-stream.md)，确认机器人可用范围和历史覆盖边界。安装锁定的官方稳定版 SDK，通过环境变量提供应用凭据，再验证并持续采集：
+
+```bash
+python -m pip install -r requirements-dingtalk.txt
+python scripts/dingtalkcracker.py doctor --live
+python scripts/dingtalkcracker.py collect \
+  --vault-dir '<钉钉消息库目录>'
+```
+
+只有当 `doctor --live` 成功、用户向机器人发送的唯一测试短语被采集、`inspect` 的 `quick_check` 为 `ok`，且 `search` 能返回该消息的 ID、发送者和时间戳时，才可声明 Stream 真实链路已经跑通。
+
+Stream 清单始终保持 `complete:false`，因为它只覆盖机器人实际收到的消息，不代表账号或群聊的全部历史。不得与 DWS 消息写入同一目录。
 
 ## 4. 梳理结果
 
