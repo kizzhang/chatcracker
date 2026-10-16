@@ -24,7 +24,7 @@ TYPE_NAMES = {1: '文本', 3: '图片', 34: '语音', 42: '名片', 43: '视频'
 _SENSITIVE_CORE = (r'(?:cdn[a-z_]*key|aeskey|authkey|filekey|file_key|session_key|encrykey|'
                    r'encryptkey|appsecret|app_secret|secret|access_token|refresh_token|'
                    r'pass_ticket|token|ticket|key|password|passwd|pwd)')
-SENSITIVE = r'(?:[a-z0-9]+[_-]){0,6}' + _SENSITIVE_CORE
+SENSITIVE = r'(?:[a-z0-9]{1,32}[_-]){0,6}' + _SENSITIVE_CORE
 
 
 def as_text(value):
@@ -44,10 +44,12 @@ def username_key(value):
 
 
 def redact(text):
-    text = re.sub(r'(?i)(' + SENSITIVE + r'\s*=\s*["\'])[^"\']*(["\'])', r'\1[REDACTED]\2', text)
+    # Quoted values match their own opening quote as the terminator (with escape
+    # handling) so a value containing the other quote cannot leak its tail.
+    text = re.sub(r'(?i)(' + SENSITIVE + r'\s*=\s*(["\']))(?:\\.|(?!\2).)*(\2)', r'\1[REDACTED]\3', text)
     text = re.sub(r'(?is)(<' + SENSITIVE + r'>).*?(</' + SENSITIVE + r'>)', r'\1[REDACTED]\2', text)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
-    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*["\'])[^"\']*(["\'])', r'\1[REDACTED]\2', text)
+    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*(["\']))(?:\\.|(?!\2).)*(\2)', r'\1[REDACTED]\3', text)
     # Bare, unquoted assignments (token=..., access_token: ...) the patterns above miss.
     return re.sub(r'(?i)\b(' + SENSITIVE + r')(\s*[:=]\s*)([^\s,;&"\'<>]{4,})', r'\1\2[REDACTED]', text)
 

@@ -9,7 +9,9 @@ import json
 from pathlib import Path
 import sqlite3
 import struct
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -569,6 +571,31 @@ class WeChatTests(unittest.TestCase):
                 with redirect_stdout(stdout):
                     handler(args, root)
                 json.loads(stdout.getvalue())  # valid JSON ⇒ no bytes leaked into output
+
+    def test_redaction_is_not_pathologically_slow_on_long_text(self):
+        blob = 'A1' * 60000  # 120k alnum chars, no separators: worst case for the prefix scan
+        start = time.perf_counter()
+        result = q.redact(blob)
+        self.assertLess(time.perf_counter() - start, 8)  # bounded ≈0.1s; the unbounded prefix regressed to minutes
+        self.assertEqual(result, blob)
+
+    def test_redaction_matches_opening_quote_and_does_not_leak_value_tail(self):
+        for text in ('{"password":"abc\'defSECRET"}', 'aeskey="abc\'defSECRET"',
+                     "authkey='va\"lSECRET'", '{"access_token":"ab\'cdSECRET"}'):
+            self.assertNotIn('SECRET', q.redact(text))
+
+    def test_output_pipeline_handles_emoji_under_legacy_code_page(self):
+        sink = io.TextIOWrapper(io.BytesIO(), encoding='cp936', errors='strict', newline='')
+        original = sys.stdout
+        sys.stdout = sink
+        try:
+            wc._force_utf8_output()
+            b.emit(success=True, app='wechat', text='安排好啦 👋')
+            sink.flush()
+            raw = sink.buffer.getvalue()
+        finally:
+            sys.stdout = original
+        self.assertIn('👋', raw.decode('utf-8'))
 
 
 if __name__ == '__main__':

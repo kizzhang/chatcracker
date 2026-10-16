@@ -1404,7 +1404,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _force_utf8_output() -> None:
+    """发出 UTF-8，避免在非 UTF-8 代码页（如 CP936/CP950）下，输出含 emoji 或
+    中文时 json.dumps(ensure_ascii=False) 触发 UnicodeEncodeError 中断整个命令。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+
+
 def main() -> int:
+    _force_utf8_output()
     parser = build_parser()
     args = parser.parse_args()
     try:
