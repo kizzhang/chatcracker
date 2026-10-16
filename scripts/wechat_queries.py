@@ -18,14 +18,38 @@ import wechat_backend as backend
 TYPE_NAMES = {1: '文本', 3: '图片', 34: '语音', 42: '名片', 43: '视频',
               47: '表情', 48: '位置', 49: '文件/链接/卡片', 50: '音视频通话',
               10000: '系统消息', 11000: '表情'}
-SENSITIVE = r'(?:aeskey|authkey|filekey|file_key|cdn[a-z_]*key|token|ticket|pass_ticket|session_key|encrykey)'
+# Credential-like keyword cores. An optional ``[a-z0-9]+[_-]`` prefix (access_, cdn_,
+# file_, client_, …) may precede them, so prefixed forms such as access_token,
+# refresh_token and my_api_key are covered without matching ordinary prose words.
+_SENSITIVE_CORE = (r'(?:cdn[a-z_]*key|aeskey|authkey|filekey|file_key|session_key|encrykey|'
+                   r'encryptkey|appsecret|app_secret|secret|access_token|refresh_token|'
+                   r'pass_ticket|token|ticket|key|password|passwd|pwd)')
+SENSITIVE = r'(?:[a-z0-9]+[_-]){0,6}' + _SENSITIVE_CORE
+
+
+def as_text(value):
+    """Decode non-UTF-8 TEXT/BLOB columns for display without raising."""
+    if isinstance(value, bytes):
+        return value.decode('utf-8', 'replace')
+    return value
+
+
+def username_key(value):
+    """Raw bytes a WeChat username hashes to, matching ``Msg_<MD5(username)>``."""
+    if isinstance(value, str):
+        return value.encode('utf-8')
+    if isinstance(value, bytes):
+        return value
+    return str(value).encode('utf-8')
 
 
 def redact(text):
     text = re.sub(r'(?i)(' + SENSITIVE + r'\s*=\s*["\'])[^"\']*(["\'])', r'\1[REDACTED]\2', text)
     text = re.sub(r'(?is)(<' + SENSITIVE + r'>).*?(</' + SENSITIVE + r'>)', r'\1[REDACTED]\2', text)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
-    return re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*["\'])[^"\']*(["\'])', r'\1[REDACTED]\2', text)
+    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*["\'])[^"\']*(["\'])', r'\1[REDACTED]\2', text)
+    # Bare, unquoted assignments (token=..., access_token: ...) the patterns above miss.
+    return re.sub(r'(?i)\b(' + SENSITIVE + r')(\s*[:=]\s*)([^\s,;&"\'<>]{4,})', r'\1\2[REDACTED]', text)
 
 
 def decode_content(value):
@@ -134,6 +158,22 @@ def db_root(directory):
     root = directory / 'db'
     if not is_account_db(root):
         raise ValueError('个人微信快照缺少 db/contact、db/session 或 db/message')
+    # The snapshot is immutable; the set of decrypted databases must still match the
+    # manifest. A dropped shard would otherwise be silently read as missing history
+    # while the snapshot still reports complete, and an added file as genuine data.
+    manifest = json.loads((directory / 'snapshot_manifest.json').read_text('utf-8'))
+    resolved_root = root.resolve()
+    listed = set()
+    for item in manifest.get('databases', []):
+        path = (root / item['relative_path']).resolve()
+        if resolved_root not in path.parents:
+            raise ValueError('快照清单中的数据库路径超出 db 目录')
+        listed.add(path)
+    present = {path.resolve() for path in root.rglob('*.db')}
+    if listed != present:
+        rel = lambda paths: sorted(str(p.relative_to(resolved_root)) for p in paths)
+        raise RuntimeError('快照与清单记录的数据库集合不一致；缺失=' + repr(rel(listed - present))
+                           + '，多余=' + repr(rel(present - listed)))
     return root
 
 
@@ -146,14 +186,14 @@ def identities(root):
     with closing(backend.ro_open(root / 'contact/contact.db')) as conn:
         for user, nick, remark in conn.execute('SELECT username,nick_name,remark FROM contact'):
             if user:
-                names[user] = remark or nick or user
+                names[as_text(user)] = as_text(remark) or as_text(nick) or as_text(user)
                 users.add(user)
     with closing(backend.ro_open(root / 'session/session.db')) as conn:
         users.update(row[0] for row in conn.execute('SELECT username FROM SessionTable') if row[0])
     for shard in shards(root):
         with closing(backend.ro_open(shard)) as conn:
             users.update(row[0] for row in conn.execute('SELECT user_name FROM Name2Id') if row[0])
-    return names, {hashlib.md5(user.encode()).hexdigest(): user for user in users}
+    return names, {hashlib.md5(username_key(user)).hexdigest(): as_text(user) for user in users}
 
 
 def query_sessions(args, directory):
@@ -194,7 +234,7 @@ def query_messages(args, directory):
     for shard in shards(root):
         with closing(backend.ro_open(shard)) as conn:
             conn.row_factory = sqlite3.Row
-            sender_map = {row[0]: row[1] for row in conn.execute('SELECT rowid,user_name FROM Name2Id')}
+            sender_map = {row[0]: as_text(row[1]) for row in conn.execute('SELECT rowid,user_name FROM Name2Id')}
             tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'Msg_*'") if re.fullmatch(r'Msg_[a-f0-9]{32}', r[0])]
             for table in tables:
                 if chat_hash and table[4:] != chat_hash:
@@ -224,14 +264,16 @@ def query_messages(args, directory):
                         continue
                     user = hashes.get(table[4:], '')
                     sender = sender_map.get(row['real_sender_id'], '')
+                    raw_type = row['local_type']
+                    base_type = (raw_type & 0xffffffff) if isinstance(raw_type, int) else raw_type
                     record = {
                         'message_id': f'{shard.name}:{table}:{row["local_id"]}',
                         'local_id': row['local_id'], 'server_id': row['server_id'],
                         'conversation_id': user or table[4:], 'conversation_name': names.get(user, user),
                         'sender_id': sender, 'sender_name': names.get(sender, sender),
                         'send_time': row['create_time'], 'send_time_iso_utc': backend.wc._timestamp_to_utc_iso(row['create_time']),
-                        'sequence': row['sort_seq'], 'content_type': row['local_type'],
-                        'type_name': TYPE_NAMES.get(row['local_type'] & 0xffffffff, str(row['local_type'])),
+                        'sequence': row['sort_seq'], 'content_type': raw_type,
+                        'type_name': TYPE_NAMES.get(base_type, str(raw_type)),
                         'text': text, 'parse_status': parse_status,
                         'source_db': shard.name, 'source_table': table,
                     }

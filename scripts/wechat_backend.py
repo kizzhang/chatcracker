@@ -72,6 +72,29 @@ def blocks(handle, regions, deadline=None):
             if data:
                 yield base+offset, data
 
+def scan_candidates(blob, pages, keys, tested):
+    for match in LITERAL.finditer(blob):
+        text = match.group(1).decode('ascii')
+        # An in-memory hex run may have an odd length (e.g. a trailing nibble);
+        # drop it so bytes.fromhex never aborts the whole scan. No whole byte is
+        # lost, so every aligned 32-byte key candidate is still examined.
+        material = bytes.fromhex(text[:len(text) & ~1])
+        for offset in range(0, max(1, len(material)-31), 16):
+            key = material[offset:offset+32]
+            explicit = material[offset+32:offset+48]
+            token = (key, explicit)
+            if len(key) != 32 or token in tested:
+                continue
+            tested.add(token)
+            for rel, page in pages.items():
+                if rel in keys:
+                    continue
+                if verify(key, page):
+                    keys[rel] = (key, page[:16])
+                elif len(explicit) == 16 and verify(key, page, explicit):
+                    keys[rel] = (key, explicit)
+
+
 def recover(files, timeout=120, verbose=False):
     if not files:
         raise ValueError('No WeChat databases found')
@@ -81,23 +104,6 @@ def recover(files, timeout=120, verbose=False):
             pages[rel] = f.read(PAGE)
     keys = {}
     tested = set()
-    def candidates(blob):
-        for match in LITERAL.finditer(blob):
-            material = bytes.fromhex(match.group(1).decode('ascii'))
-            for offset in range(0, max(1, len(material)-31), 16):
-                key = material[offset:offset+32]
-                explicit = material[offset+32:offset+48]
-                token = (key, explicit)
-                if len(key) != 32 or token in tested:
-                    continue
-                tested.add(token)
-                for rel, page in pages.items():
-                    if rel in keys:
-                        continue
-                    if verify(key, page):
-                        keys[rel] = (key, page[:16])
-                    elif len(explicit) == 16 and verify(key, page, explicit):
-                        keys[rel] = (key, explicit)
     for pid in pids():
         handle = wc.kernel32.OpenProcess(wc.PROCESS_VM_READ | wc.PROCESS_QUERY_INFORMATION, False, pid)
         if not handle:
@@ -109,7 +115,7 @@ def recover(files, timeout=120, verbose=False):
             regions = list(wc.iter_readable_regions(handle))
             anchors = set()
             for base, data in blocks(handle, regions, deadline):
-                candidates(data)
+                scan_candidates(data, pages, keys, tested)
                 pos = 0
                 while (pos := data.find(ANCHOR, pos)) >= 0:
                     anchors.add(base+pos)
@@ -142,7 +148,7 @@ def recover(files, timeout=120, verbose=False):
                             continue
                         blob = wc.read_process_memory(handle, bptr, length)
                         if blob and len(blob) == length:
-                            candidates(bytes(v ^ MASK[i % len(MASK)] for i, v in enumerate(blob)))
+                            scan_candidates(bytes(v ^ MASK[i % len(MASK)] for i, v in enumerate(blob)), pages, keys, tested)
                 if verbose:
                     emit(event='config_pass', pid=pid, validated_databases=len(keys), total=len(files))
             if len(keys) == len(files):

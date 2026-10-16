@@ -37,6 +37,12 @@ def encrypt(aes, data, iv):
     return output.raw
 
 
+def manifest_with_dbs(db):
+    dbs = [{'relative_path': p.relative_to(db).as_posix()} for p in sorted(db.rglob('*.db'))]
+    return json.dumps({'format': 'wechat-local-snapshot-v1', 'success': True, 'failed': 0,
+                       'complete': True, 'wal_processed': True, 'databases': dbs})
+
+
 class WeChatTests(unittest.TestCase):
     def setUp(self):
         self.key = bytes(range(32))
@@ -178,7 +184,7 @@ class WeChatTests(unittest.TestCase):
                     table = 'Msg_' + hashlib.md5(who.encode()).hexdigest()
                     c.execute('CREATE TABLE ' + table + '(local_id,server_id,real_sender_id,create_time,sort_seq,local_type,message_content,compress_content)')
                     c.execute('INSERT INTO ' + table + ' VALUES(1,2,?,?,?,?,?,NULL)', (sid, stamp, stamp, 1, '会议 ' + who))
-            (root / 'snapshot_manifest.json').write_text(json.dumps({'format':'wechat-local-snapshot-v1','success':True,'failed':0,'complete':True,'wal_processed':True}))
+            (root / 'snapshot_manifest.json').write_text(manifest_with_dbs(db))
             before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in db.rglob('*') if p.is_file()}
             args = Namespace(conversation_id=None, keyword='会议', since=0, until=300, limit=1)
             stdout = io.StringIO()
@@ -218,7 +224,7 @@ class WeChatTests(unittest.TestCase):
                     c.execute('CREATE TABLE ' + table + '(local_id,server_id,real_sender_id,create_time,sort_seq,local_type,message_content,compress_content)')
                     c.executemany('INSERT INTO ' + table + ' VALUES(?,2,1,?,?,1,?,NULL)',
                                   [(local, stamp, seq, '会议 ' + str(seq)) for local, stamp, seq in rows])
-            (root / 'snapshot_manifest.json').write_text(json.dumps({'format':'wechat-local-snapshot-v1','success':True,'failed':0,'complete':True,'wal_processed':True}))
+            (root / 'snapshot_manifest.json').write_text(manifest_with_dbs(db))
             before = {p: p.read_bytes() for p in db.rglob('*.db')}
             for keyword in (None, '会议'):
                 for limit in (1, 2, 4):
@@ -263,7 +269,7 @@ class WeChatTests(unittest.TestCase):
                 c.execute("INSERT INTO Name2Id VALUES('alice')")
                 c.execute('CREATE TABLE ' + table + '(local_id,server_id,real_sender_id,create_time,sort_seq,local_type,message_content,compress_content)')
                 c.executemany('INSERT INTO ' + table + ' VALUES(?,2,1,100,1,1,?,?)', rows)
-            (root / 'snapshot_manifest.json').write_text(json.dumps({'format':'wechat-local-snapshot-v1','success':True,'failed':0,'complete':True,'wal_processed':True}))
+            (root / 'snapshot_manifest.json').write_text(manifest_with_dbs(db))
             for keyword in (None, '会议'):
                 args = Namespace(conversation_id='alice', keyword=keyword, since=None, until=None, limit=10)
                 stdout = io.StringIO()
@@ -470,6 +476,99 @@ class WeChatTests(unittest.TestCase):
             self.assertIn(str(staging), str(caught.exception))
             self.assertIn('synthetic validation failure', str(caught.exception))
             self.assertFalse(Path(args.out_dir).exists())
+
+    def test_scan_candidates_tolerates_odd_length_hex_runs(self):
+        page = self.page(1)[0]
+        pages = {'contact/contact.db': page}
+        odd = b"x'" + b'ab' * 40 + b'c' + b"'"  # 81 hex chars; bytes.fromhex would reject it
+        good = b"x'" + self.key.hex().encode() + b"'"
+        keys, tested = {}, set()
+        b.scan_candidates(odd + b'  ' + good, pages, keys, tested)
+        self.assertEqual(keys['contact/contact.db'], (self.key, page[:16]))
+        keys2, tested2 = {}, set()
+        b.scan_candidates(odd, pages, keys2, tested2)  # odd run alone must not raise
+        self.assertEqual(keys2, {})
+
+    def query_fixture(self, db, rows, user='alice'):
+        for folder in ('contact', 'session', 'message'):
+            (db / folder).mkdir(parents=True, exist_ok=True)
+        with writable(db / 'contact/contact.db') as c:
+            c.execute('CREATE TABLE contact(username,nick_name,remark)')
+        with writable(db / 'session/session.db') as c:
+            c.execute('CREATE TABLE SessionTable(username)')
+        table = 'Msg_' + hashlib.md5(user.encode()).hexdigest()
+        with writable(db / 'message/message_0.db') as c:
+            c.execute('CREATE TABLE Name2Id(user_name)')
+            c.execute('INSERT INTO Name2Id VALUES(?)', (user,))
+            c.execute('CREATE TABLE ' + table + '(local_id,server_id,real_sender_id,create_time,sort_seq,local_type,message_content,compress_content)')
+            c.executemany('INSERT INTO ' + table + ' VALUES(?,2,1,100,1,?,?,NULL)', rows)
+        (db.parent / 'snapshot_manifest.json').write_text(manifest_with_dbs(db))
+
+    def test_null_local_type_is_rendered_without_crashing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.query_fixture(root / 'db', [(1, None, '会议'), (2, 1 << 32 | 3, '图片占位')])
+            args = Namespace(conversation_id='alice', keyword=None, since=None, until=None, limit=10)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                q.query_messages(args, root)
+            records = {r['local_id']: r for r in json.loads(stdout.getvalue())['messages']}
+            self.assertIsNone(records[1]['content_type'])
+            self.assertEqual(records[1]['type_name'], 'None')
+            self.assertEqual(records[1]['text'], '会议')
+            self.assertEqual(records[2]['type_name'], '图片')  # composite type still uses low 32 bits
+
+    def test_query_refuses_snapshot_whose_databases_drift_from_manifest(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); db = root / 'db'
+            self.query_fixture(db, [(1, 1, '会议一')])
+            table = 'Msg_' + hashlib.md5(b'alice').hexdigest()
+            with writable(db / 'message/message_1.db') as c:
+                c.execute('CREATE TABLE Name2Id(user_name)')
+                c.execute("INSERT INTO Name2Id VALUES('alice')")
+                c.execute('CREATE TABLE ' + table + '(local_id,server_id,real_sender_id,create_time,sort_seq,local_type,message_content,compress_content)')
+                c.execute('INSERT INTO ' + table + ' VALUES(2,2,1,200,1,1,?,NULL)', ('会议二',))
+            (root / 'snapshot_manifest.json').write_text(manifest_with_dbs(db))
+            args = Namespace(conversation_id=None, keyword=None, since=None, until=None, limit=10)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                q.query_messages(args, root)
+            self.assertEqual(json.loads(stdout.getvalue())['count'], 2)
+            (db / 'message/message_1.db').unlink()  # manifest still lists it
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, '不一致'):
+                q.query_messages(args, root)
+            (db / 'message/message_1.db').write_bytes(bytes(b.PAGE))
+            (db / 'message/message_9.db').write_bytes(bytes(b.PAGE))  # not in manifest
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, '不一致'):
+                q.query_sessions(Namespace(keyword=None, limit=10), root)
+
+    def test_redaction_covers_prefixed_and_bare_credentials(self):
+        leaky = ('https://api.weixin.qq.com/cgi-bin/media/get?access_token=ACCESS_SECRET&media_id=123 '
+                 'token=TOKEN_SECRET refresh_token: REFRESH_SECRET my_api_key=KEYSECRET123')
+        cleaned = q.redact(leaky)
+        for secret in ('ACCESS_SECRET', 'TOKEN_SECRET', 'REFRESH_SECRET', 'KEYSECRET123'):
+            self.assertNotIn(secret, cleaned)
+        self.assertIn('media_id=123', cleaned)
+        plain = '下周三 10:00 开会，会议室 key 在前台'
+        self.assertEqual(q.redact(plain), plain)
+
+    def test_non_utf8_text_columns_do_not_crash_queries(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); db = root / 'db'
+            self.query_fixture(db, [(1, 1, '会议')])
+            with writable(db / 'contact/contact.db') as c:
+                c.execute('INSERT INTO contact VALUES(?,?,?)', (b'\xff\xfe', b'\xff', 'bad'))
+            names, hashes = q.identities(q.db_root(root))
+            self.assertIn(hashlib.md5(b'alice').hexdigest(), hashes)
+            self.assertIn(hashlib.md5(b'\xff\xfe').hexdigest(), hashes)
+            for handler, args in (
+                (q.query_sessions, Namespace(keyword=None, limit=10)),
+                (q.query_messages, Namespace(conversation_id='alice', keyword=None, since=None, until=None, limit=10)),
+            ):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    handler(args, root)
+                json.loads(stdout.getvalue())  # valid JSON ⇒ no bytes leaked into output
 
 
 if __name__ == '__main__':
