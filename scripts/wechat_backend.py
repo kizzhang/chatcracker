@@ -345,7 +345,9 @@ def validate_database(path):
                 raise RuntimeError('SQLite quick_check failed')
         except sqlite3.OperationalError:
             virtual = [row for row in schema if row[2] == 0 and (row[1] or '').upper().startswith('CREATE VIRTUAL TABLE')]
-            if not virtual or not all('USING fts5' in row[1] and 'MMFtsTokenizer' in row[1] for row in virtual):
+            # SQL keywords are case-insensitive, so match USING FTS5 case-insensitively;
+            # MMFtsTokenizer stays an exact identifier check.
+            if not virtual or not all('USING FTS5' in (row[1] or '').upper() and 'MMFtsTokenizer' in (row[1] or '') for row in virtual):
                 raise
             physical = ['sqlite_schema'] + [row[0] for row in schema if row[2] > 0]
             for name in physical:

@@ -592,7 +592,9 @@ class WeChatTests(unittest.TestCase):
                      '{"access_token":"untermSECRET',   # no closing quote (json form)
                      'aeskey="line1\nSECREThidden"',    # value spans a newline
                      'password=p@ss!w0rdSECRET',        # punctuation in an unquoted value
-                     '{"password":p@SECRET!}'):         # punctuation in an unquoted json value
+                     '{"password":p@SECRET!}',          # punctuation in an unquoted json value
+                     '<aeskey><![CDATA[0123456789abcdefSECRET]]></aeskey>',  # key inside CDATA
+                     '<filekey>plainSECRETkey</filekey>'):                   # plain tag body
             self.assertNotIn('SECRET', q.redact(text), text)
         self.assertNotIn('123456789', q.redact('{"password":123456789}'))  # numeric value
         self.assertNotIn('987654321', q.redact('{"token": 987654321}'))
@@ -637,6 +639,24 @@ class WeChatTests(unittest.TestCase):
         for bad in (-100000, -99999999999, b'not-a-number', 'x'):
             self.assertIsNone(wc._timestamp_to_utc_iso(bad))
         self.assertTrue(wc._timestamp_to_utc_iso(1700000000).startswith('20'))
+
+    def test_zstd_multi_frame_body_is_fully_decoded(self):
+        from compression import zstd
+        blob = zstd.compress(b'first frame ') + zstd.compress('TODO 第二帧'.encode())
+        text, status = q.decode_content(blob)
+        self.assertEqual(status, 'zstd')
+        self.assertIn('first frame', text)
+        self.assertIn('TODO', text)
+        self.assertIn('第二帧', text)
+
+    def test_doctor_reports_elevated_instead_of_crashing(self):
+        args = Namespace(command='doctor', data_root=tempfile.mkdtemp())
+        stdout = io.StringIO()
+        with patch.object(b.wc.shell32, 'IsUserAnAdmin', return_value=1), redirect_stdout(stdout):
+            self.assertEqual(q.dispatch(args), 0)
+        data = json.loads(stdout.getvalue())
+        self.assertTrue(data['success'] and data['elevated'])
+        self.assertIsNone(data['same_session_weixin_process_count'])
 
 
 if __name__ == '__main__':

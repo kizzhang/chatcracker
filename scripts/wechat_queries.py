@@ -53,9 +53,10 @@ def redact(text):
     # crossing the other quote / an embedded newline cannot leak a tail.
     text = re.sub(r'(?i)(\b' + SENSITIVE + r'\s*=\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
     text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
-    # Tag body is [^<]* (not a lazy .*?), so an unmatched <token> run cannot rescan the
-    # rest of the text from every start — matching stays linear.
-    text = re.sub(r'(?is)(<' + SENSITIVE + r'>)[^<]*(</' + SENSITIVE + r'>)', r'\1[REDACTED]\2', text)
+    # Redact the token run right after an opening sensitive tag, allowing an optional
+    # CDATA wrapper. Matching the value (not the closing tag) keeps it linear — an
+    # unmatched <token> run cannot rescan the text — and still reaches keys inside CDATA.
+    text = re.sub(r'(?i)(<' + SENSITIVE + r'>\s*(?:<!\[CDATA\[\s*)?)([A-Za-z0-9+/_.=\-]+)', r'\1[REDACTED]', text)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
     # Fallbacks for unquoted, numeric, or unterminated-quoted values (e.g. token=abc,
     # {"password":123456}, aeskey="unterminated, password=p@ssw0rd!). The value runs to the
@@ -81,10 +82,19 @@ def decode_content(value):
         except ImportError as error:
             raise RuntimeError('个人微信压缩消息需要 Python 3.14 的 compression.zstd') from error
         try:
-            decompressor = ZstdDecompressor()
-            value = decompressor.decompress(value, max_length=ZSTD_MAX_OUTPUT)
-            if not decompressor.eof:
-                return '', 'zstd_unresolved'  # output exceeds the cap; refuse a bomb
+            # Decode every concatenated frame (standard library semantics) within a
+            # cumulative output cap, so multi-frame bodies are not silently truncated
+            # while a decompression bomb is still refused.
+            chunks, total, remaining = [], 0, value
+            while remaining:
+                decompressor = ZstdDecompressor()
+                chunk = decompressor.decompress(remaining, max_length=ZSTD_MAX_OUTPUT - total + 1)
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > ZSTD_MAX_OUTPUT or not decompressor.eof:
+                    return '', 'zstd_unresolved'  # exceeds the cap; refuse a bomb
+                remaining = decompressor.unused_data
+            value = b''.join(chunks)
             status = 'zstd'
         except Exception:
             return '', 'zstd_unresolved'
@@ -308,7 +318,11 @@ def query_messages(args, directory):
 def dispatch(args):
     if args.command in ('discover', 'doctor'):
         accounts = discover(args.data_root)
-        sources = [{'db_dir': str(p), 'account': p.parent.name, 'database_count': len(list(p.rglob('*.db')))} for p in accounts]
+        # Count only databases decrypt would process; the reserved db is always skipped.
+        sources = [{'db_dir': str(p), 'account': p.parent.name,
+                    'database_count': sum(1 for db in p.rglob('*.db')
+                                          if db.relative_to(p).as_posix().casefold() != 'migrate/unspportmsg.db')}
+                   for p in accounts]
         if args.command == 'discover':
             backend.emit(success=True, app='wechat', count=len(sources), sources=sources)
         else:
@@ -319,7 +333,11 @@ def dispatch(args):
                 zstd_available = False
             with backend.wc.WindowsAesCbc() as aes:
                 backend.cng256_test(aes)
-            backend.emit(success=True, app='wechat', windows=platform.platform(), python=platform.python_version(), python_64_bit=struct.calcsize('P') == 8, stdlib_zstd=zstd_available, cng_aes256_self_test='ok', same_session_weixin_process_count=len(backend.pids()), sources=sources)
+            # An elevated shell cannot scan same-session processes; report it instead of
+            # aborting the whole diagnostic (as the WeCom doctor does).
+            elevated = bool(backend.wc.shell32.IsUserAnAdmin())
+            weixin_count = None if elevated else len(backend.pids())
+            backend.emit(success=True, app='wechat', windows=platform.platform(), python=platform.python_version(), python_64_bit=struct.calcsize('P') == 8, stdlib_zstd=zstd_available, cng_aes256_self_test='ok', elevated=elevated, same_session_weixin_process_count=weixin_count, sources=sources)
         return 0
     if args.command == 'decrypt':
         return backend.snapshot(args)
