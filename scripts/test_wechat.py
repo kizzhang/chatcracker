@@ -40,7 +40,9 @@ def encrypt(aes, data, iv):
 
 
 def manifest_with_dbs(db):
-    dbs = [{'relative_path': p.relative_to(db).as_posix()} for p in sorted(db.rglob('*.db'))]
+    dbs = [{'relative_path': p.relative_to(db).as_posix(),
+            'snapshot_sha256': hashlib.sha256(p.read_bytes()).hexdigest()}
+           for p in sorted(db.rglob('*.db'))]
     return json.dumps({'format': 'wechat-local-snapshot-v1', 'success': True, 'failed': 0,
                        'complete': True, 'wal_processed': True, 'databases': dbs})
 
@@ -108,18 +110,22 @@ class WeChatTests(unittest.TestCase):
         self.assertEqual(b.committed_wal(wal, self.aes, self.mkey, self.wal_index(0))[0], [])
         with self.assertRaises(RuntimeError):
             b.committed_wal(wal, self.aes, self.mkey, self.wal_index(3))
-        # frame 1 stale while 2 and 3 are current is impossible in a valid WAL: refuse it
-        # as corrupt rather than silently dropping the current committed frames.
+        # A current-generation frame whose salt was corrupted still chains from the running
+        # checksum (the salt is not covered by it), so it must be refused, not dropped.
         corrupt = bytearray(wal); corrupt[40:48] = b'OLD12345'
         with self.assertRaises(RuntimeError):
             b.committed_wal(corrupt, self.aes, self.mkey)
         with self.assertRaises(RuntimeError):
             b.committed_wal(corrupt, self.aes, self.mkey, self.wal_index(2))
-        # a genuinely stale tail (every frame from an older generation) yields no frames
-        fully_stale = bytearray(wal)
-        for off in range(40, len(wal), 4120):
-            fully_stale[off:off+8] = b'OLD12345'
-        self.assertEqual(b.committed_wal(fully_stale, self.aes, self.mkey)[0], [])
+        # corrupting the LAST committed frame's salt must also be refused, not silently dropped.
+        last = bytearray(self.wal(commit_at=(2, 3)))
+        last[32 + 2*4120 + 8] ^= 1
+        with self.assertRaises(RuntimeError):
+            b.committed_wal(last, self.aes, self.mkey)
+        # a genuine older-generation frame (salt differs AND its checksum does not chain)
+        # is the benign end of the current generation.
+        genuine = bytearray(wal); genuine[40:48] = b'OLD12345'; genuine[48] ^= 1
+        self.assertEqual(b.committed_wal(genuine, self.aes, self.mkey)[0], [])
         # a partial trailing frame without a WAL index cannot be confirmed complete
         with self.assertRaisesRegex(RuntimeError, 'partial trailing'):
             b.committed_wal(bytes(wal) + bytes(100), self.aes, self.mkey)
@@ -571,6 +577,7 @@ class WeChatTests(unittest.TestCase):
             self.query_fixture(db, [(1, 1, '会议')])
             with writable(db / 'contact/contact.db') as c:
                 c.execute('INSERT INTO contact VALUES(?,?,?)', (b'\xff\xfe', b'\xff', 'bad'))
+            (root / 'snapshot_manifest.json').write_text(manifest_with_dbs(db))  # refresh hashes after the edit
             names, hashes = q.identities(q.db_root(root))
             self.assertIn(hashlib.md5(b'alice').hexdigest(), hashes)
             self.assertIn(hashlib.md5(b'\xff\xfe').hexdigest(), hashes)
@@ -609,8 +616,14 @@ class WeChatTests(unittest.TestCase):
                      '<password>p@ss!w0rdSECRET</password>',                 # punctuation in a tag
                      '<aeskey><![CDATA[\nab!c\nSECRET\n]]></aeskey>',        # punctuation + newlines
                      '<password>]bracketSECRET</password>',                 # ] is a value char, not a terminator
-                     '<aeskey><![CDATA[]x]SECRET]]></aeskey>'):              # ] inside CDATA value
+                     '<aeskey><![CDATA[]x]SECRET]]></aeskey>',               # ] inside CDATA value
+                     '<aeskey >SYNTH_SECRET</aeskey>',                       # whitespace before >
+                     '<aeskey attr="1">SYNTH_SECRET</aeskey>',              # attribute in opening tag
+                     '<password><![CDATA[p<a<ssSECRET]]></password>'):       # < inside CDATA body
             self.assertNotIn('SECRET', q.redact(text), text)
+        # tags whose name merely starts with a sensitive word must be left intact
+        for keep in ('<aeskeyring>door</aeskeyring>', '<tokenizer>x</tokenizer>'):
+            self.assertEqual(q.redact(keep), keep)
         self.assertNotIn('123456789', q.redact('{"password":123456789}'))  # numeric value
         self.assertNotIn('987654321', q.redact('{"token": 987654321}'))
         self.assertEqual(q.redact('token=abc'), 'token=[REDACTED]')  # short value still masked
@@ -685,6 +698,17 @@ class WeChatTests(unittest.TestCase):
             with patch.object(b, 'recover', side_effect=AssertionError('must not scan')), \
                  self.assertRaisesRegex(ValueError, 'db_storage'):
                 b.snapshot(args)
+
+    def test_query_rejects_content_modified_snapshot(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.query_fixture(root / 'db', [(1, 1, '会议')])  # manifest records each db's SHA-256
+            table = 'Msg_' + hashlib.md5(b'alice').hexdigest()
+            with writable(root / 'db/message/message_0.db') as c:  # modify content, same filename set
+                c.execute('UPDATE ' + table + " SET message_content='篡改'")
+            args = Namespace(conversation_id='alice', keyword=None, since=None, until=None, limit=10)
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'SHA-256'):
+                q.query_messages(args, root)
 
     def test_stable_capture_retries_transiently_inconsistent_wal_index(self):
         with tempfile.TemporaryDirectory() as raw:

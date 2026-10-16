@@ -56,7 +56,11 @@ def redact(text):
     # Redact the token run right after an opening sensitive tag, allowing an optional
     # CDATA wrapper. Matching the value (not the closing tag) keeps it linear — an
     # unmatched <token> run cannot rescan the text — and still reaches keys inside CDATA.
-    text = re.sub(r'(?i)(<' + SENSITIVE + r'>\s*(?:<!\[CDATA\[\s*)?)([^<]+)', r'\1[REDACTED]', text)
+    # Sensitive XML tags, tolerating attributes/whitespace in the opening tag. CDATA bodies
+    # may legally contain '<', so they are matched up to ']]>'; a plain body stops at the
+    # next tag. Both match the value (not the closing tag), which keeps them linear.
+    text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]*>\s*<!\[CDATA\[)([^\]]*(?:\](?!\]>)[^\]]*)*)', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]*>\s*)([^<]+)', r'\1[REDACTED]', text)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
     # Fallbacks for unquoted, numeric, or unterminated-quoted values (e.g. token=abc,
     # {"password":123456}, aeskey="unterminated, password=p@ssw0rd!). The value runs to the
@@ -213,6 +217,15 @@ def db_root(directory):
         rel = lambda paths: sorted(str(p.relative_to(resolved_root)) for p in paths)
         raise RuntimeError('快照与清单记录的数据库集合不一致；缺失=' + repr(rel(listed - present))
                            + '，多余=' + repr(rel(present - listed)))
+    # Verify each database's content against the manifest SHA-256, so a query never
+    # returns results from a file modified after the snapshot was validated.
+    for item in manifest.get('databases', []):
+        recorded = item.get('snapshot_sha256')
+        path = root / item['relative_path']
+        if recorded and path.is_file():
+            with path.open('rb') as stream:
+                if hashlib.file_digest(stream, 'sha256').hexdigest() != recorded:
+                    raise RuntimeError('快照数据库内容与清单 SHA-256 不一致：' + item['relative_path'])
     return root
 
 

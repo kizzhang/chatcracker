@@ -269,6 +269,7 @@ def checksum(data, endian, state=(0, 0)):
     return a, b
 
 def committed_wal(wal, aes, mkey, wal_index=None):
+    wal = bytes(wal)  # ctypes decrypt needs an immutable bytes buffer, not a bytearray
     expected_frames = wal_index['frames'] if wal_index is not None else None
     metadata = {'wal_processed': True, 'valid_frames': 0, 'applied_frames': 0, 'committed_pages': None, 'tail': 'none'}
     if not wal:
@@ -298,12 +299,18 @@ def committed_wal(wal, aes, mkey, wal_index=None):
     for offset in range(32, stop, 4120):
         header = wal[offset:offset+24]
         if header[8:16] != salt:
-            # A valid WAL holds the current generation's frames first and only stale
-            # leftovers at the tail. A current-salt frame after this point means the WAL
-            # is inconsistent (e.g. a corrupted salt), so refuse it rather than silently
-            # dropping committed frames while still reporting the snapshot complete.
-            if any(wal[later+8:later+16] == salt for later in range(offset+4120, stop, 4120)):
-                raise RuntimeError('WAL frame salt is inconsistent; refusing possibly-corrupt WAL')
+            # The frame checksum does not cover the salt, so a current-generation frame
+            # whose salt was corrupted still chains from the running checksum, whereas a
+            # genuine older-generation stale frame does not. Refuse the former (it would
+            # silently drop a committed frame yet still report the snapshot complete);
+            # accept the latter as the benign end of the current generation.
+            page = wal[offset+24:offset+4120]
+            number = struct.unpack_from('>I', header)[0]
+            stored = struct.unpack_from('>II', header, 16)
+            for candidate in (('encrypted', 'plaintext') if mode is None else (mode,)):
+                data = page if candidate == 'encrypted' else page_decrypt(aes, page, number)
+                if checksum(header[:8] + data, endian, state) == stored:
+                    raise RuntimeError('WAL frame salt is inconsistent with a chaining checksum; refusing possibly-corrupt WAL')
             metadata['tail'] = 'stale_generation'
             break
         number, commit_size = struct.unpack_from('>II', header)
