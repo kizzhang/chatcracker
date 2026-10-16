@@ -202,11 +202,16 @@ def stable_capture(source, dest):
     shm_path = Path(str(source) + '-shm')
     for attempt in range(12):
         before = stat_signature(source)
-        shm_before = read_shm_header(shm_path)
-        wal_before = wal_path.read_bytes() if wal_path.exists() else b''
-        shutil.copyfile(source, dest)
-        wal_after = wal_path.read_bytes() if wal_path.exists() else b''
-        shm_after = read_shm_header(shm_path)
+        try:
+            shm_before = read_shm_header(shm_path)
+            wal_before = wal_path.read_bytes() if wal_path.exists() else b''
+            shutil.copyfile(source, dest)
+            wal_after = wal_path.read_bytes() if wal_path.exists() else b''
+            shm_after = read_shm_header(shm_path)
+        except FileNotFoundError:
+            # SQLite may unlink/recreate a sidecar after the existence check.
+            time.sleep(0.15)
+            continue
         after = stat_signature(source)
         if before == after and wal_before == wal_after and shm_before == shm_after:
             wal_index = wal_index_state(shm_before)
@@ -316,6 +321,35 @@ def is_utf8(data):
     except UnicodeDecodeError:
         return False
 
+def validate_database(path):
+    before = stat_signature(path)
+    with closing(ro_open(path)) as conn:
+        schema = conn.execute("SELECT name, sql, rootpage FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+        tables = [{'name': row[0], 'sql': row[1]} for row in schema]
+        scope = 'database'
+        try:
+            check = [row[0] for row in conn.execute('PRAGMA quick_check')]
+            if check != ['ok']:
+                raise RuntimeError('SQLite quick_check failed')
+        except sqlite3.OperationalError:
+            virtual = [row for row in schema if row[2] == 0 and (row[1] or '').upper().startswith('CREATE VIRTUAL TABLE')]
+            if not virtual or not all('USING fts5' in row[1] and 'MMFtsTokenizer' in row[1] for row in virtual):
+                raise
+            physical = ['sqlite_schema'] + [row[0] for row in schema if row[2] > 0]
+            for name in physical:
+                result = [row[0] for row in conn.execute('PRAGMA quick_check("' + name.replace('"', '""') + '")')]
+                if result != ['ok']:
+                    raise RuntimeError('Physical table quick_check failed')
+            scope = 'all_physical_tables_and_schema; custom_FTS_tokenizer_semantics_not_checked'
+    with path.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if before != stat_signature(path):
+        raise RuntimeError('Snapshot database changed during validation')
+    wc._assert_no_plaintext_wal(path)
+    return {'quick_check': 'ok', 'quick_check_scope': scope, 'tables': tables,
+            'snapshot_sha256': digest, 'bytes': before[0]}
+
+
 def snapshot_one(backend, source, dest, key, salt):
     dest.parent.mkdir(parents=True, exist_ok=True)
     encrypted_copy = dest.with_suffix('.capture')
@@ -347,28 +381,9 @@ def snapshot_one(backend, source, dest, key, salt):
                 out.truncate(size*PAGE)
                 out.seek(28)
                 out.write(struct.pack('>I', size))
-        with closing(ro_open(dest)) as conn:
-            schema = conn.execute("SELECT name, sql, rootpage FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
-            tables = [{'name': row[0], 'sql': row[1]} for row in schema]
-            scope = 'database'
-            try:
-                check = [row[0] for row in conn.execute('PRAGMA quick_check')]
-                if check != ['ok']:
-                    raise RuntimeError('SQLite quick_check failed')
-            except sqlite3.OperationalError:
-                virtual = [row for row in schema if row[2] == 0 and (row[1] or '').upper().startswith('CREATE VIRTUAL TABLE')]
-                if not virtual or not all('USING fts5' in row[1] and 'MMFtsTokenizer' in row[1] for row in virtual):
-                    raise
-                physical = ['sqlite_schema'] + [row[0] for row in schema if row[2] > 0]
-                for name in physical:
-                    result = [row[0] for row in conn.execute('PRAGMA quick_check("' + name.replace('"', '""') + '")')]
-                    if result != ['ok']:
-                        raise RuntimeError('Physical table quick_check failed')
-                scope = 'all_physical_tables_and_schema; custom_FTS_tokenizer_semantics_not_checked'
         info.update(wal_info)
-        info.update(quick_check='ok', quick_check_scope=scope, authenticated_pages=authenticated, blank_pages=blank_pages, tables=tables)
-        with dest.open('rb') as f:
-            info['snapshot_sha256'] = hashlib.file_digest(f, 'sha256').hexdigest()
+        info.update(validate_database(dest))
+        info.update(authenticated_pages=authenticated, blank_pages=blank_pages)
         return info
     finally:
         aes.close()

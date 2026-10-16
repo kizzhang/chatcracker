@@ -214,8 +214,10 @@ def query_messages(args, directory):
                     text, parse_status = decode_content(row['message_content'])
                     if not text and row['compress_content']:
                         fallback, fallback_status = decode_content(row['compress_content'])
-                        if fallback:
+                        if fallback or parse_status == 'empty':
                             text, parse_status = fallback, 'compress_content:' + fallback_status
+                        else:
+                            parse_status += ';compress_content:' + fallback_status
                     if 'unresolved' in parse_status:
                         unresolved += 1
                     if keyword and keyword.casefold() not in text.casefold():
@@ -269,5 +271,20 @@ def dispatch(args):
     status = snapshot_status(directory)
     root = db_root(directory)
     manifest = json.loads((directory / 'snapshot_manifest.json').read_text('utf-8'))
-    backend.emit(success=True, app='wechat', **status, databases=[{'relative_path': item['relative_path'], 'quick_check': item.get('quick_check'), 'quick_check_scope': item.get('quick_check_scope'), 'bytes': (root / item['relative_path']).stat().st_size} for item in manifest['databases']])
+    records = []
+    for item in manifest['databases']:
+        relative = item['relative_path']
+        path = (root / relative).resolve()
+        if root.resolve() not in path.parents:
+            raise ValueError('快照清单中的数据库路径超出 db 目录')
+        try:
+            current = backend.validate_database(path)
+            if current['snapshot_sha256'] != item.get('snapshot_sha256'):
+                raise RuntimeError('Snapshot SHA-256 does not match the validated manifest')
+        except Exception as error:
+            raise RuntimeError(f'{relative}: {error}') from error
+        records.append({'relative_path': relative, 'quick_check': current['quick_check'],
+                        'quick_check_scope': current['quick_check_scope'], 'bytes': current['bytes'],
+                        'snapshot_sha256': current['snapshot_sha256'], 'hash_matches': True})
+    backend.emit(success=True, app='wechat', **status, databases=records)
     return 0

@@ -242,6 +242,148 @@ class WeChatTests(unittest.TestCase):
         keys = {p.relative_to(source).as_posix(): (self.key, self.salt) for p in source.rglob('*.db')}
         return source, args, keys
 
+    def test_compressed_content_failures_are_preserved_and_counted(self):
+        from compression import zstd
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); db = root / 'db'
+            for folder in ('contact', 'session', 'message'):
+                (db / folder).mkdir(parents=True)
+            with writable(db / 'contact/contact.db') as c:
+                c.execute('CREATE TABLE contact(username,nick_name,remark)')
+            with writable(db / 'session/session.db') as c:
+                c.execute('CREATE TABLE SessionTable(username)')
+            bad_zstd = b'\x28\xb5\x2f\xfd\xff'
+            rows = [(1, '', b'\xff'), (2, None, bad_zstd),
+                    (3, b'\xff', zstd.compress('会议恢复'.encode())),
+                    (4, '会议正文', bad_zstd), (5, b'\xff', bad_zstd),
+                    (6, '', zstd.compress(b''))]
+            table = 'Msg_' + hashlib.md5(b'alice').hexdigest()
+            with writable(db / 'message/message_0.db') as c:
+                c.execute('CREATE TABLE Name2Id(user_name)')
+                c.execute("INSERT INTO Name2Id VALUES('alice')")
+                c.execute('CREATE TABLE ' + table + '(local_id,server_id,real_sender_id,create_time,sort_seq,local_type,message_content,compress_content)')
+                c.executemany('INSERT INTO ' + table + ' VALUES(?,2,1,100,1,1,?,?)', rows)
+            (root / 'snapshot_manifest.json').write_text(json.dumps({'format':'wechat-local-snapshot-v1','success':True,'failed':0,'complete':True,'wal_processed':True}))
+            for keyword in (None, '会议'):
+                args = Namespace(conversation_id='alice', keyword=keyword, since=None, until=None, limit=10)
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    q.query_messages(args, root)
+                result = json.loads(stdout.getvalue())
+                self.assertEqual(result['scanned_unresolved_messages'], 3)
+                records = {r['local_id']: r for r in result['messages']}
+                self.assertEqual(records[3]['parse_status'], 'compress_content:zstd')
+                self.assertEqual(records[4]['parse_status'], 'utf8')
+                if keyword is None:
+                    self.assertEqual(records[1]['parse_status'], 'compress_content:binary_unresolved')
+                    self.assertEqual(records[2]['parse_status'], 'compress_content:zstd_unresolved')
+                    self.assertIn('binary_unresolved', records[5]['parse_status'])
+                    self.assertIn('compress_content:zstd_unresolved', records[5]['parse_status'])
+                    self.assertEqual(records[6]['parse_status'], 'compress_content:zstd')
+                else:
+                    self.assertEqual(set(records), {3, 4})
+
+    def inspection_fixture(self, root):
+        db = root / 'db'
+        manifest = {'format': 'wechat-local-snapshot-v1', 'success': True, 'failed': 0,
+                    'complete': True, 'wal_processed': True, 'databases': []}
+        for name in ('contact/contact.db', 'session/session.db', 'message/message_0.db'):
+            path = db / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with writable(path) as c:
+                c.execute('CREATE TABLE data(value)')
+                c.execute("INSERT INTO data VALUES('before')")
+            manifest['databases'].append({'relative_path': name, 'quick_check': 'ok',
+                                         'quick_check_scope': 'cached_scope',
+                                         'snapshot_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+        (root / 'snapshot_manifest.json').write_text(json.dumps(manifest))
+        return manifest
+
+    def test_inspection_reruns_checks_and_matches_hash_without_writing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manifest = self.inspection_fixture(root)
+            before = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in root.rglob('*') if p.is_file()}
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(q.dispatch(Namespace(command='inspect', decrypted_dir=str(root))), 0)
+            records = json.loads(stdout.getvalue())['databases']
+            for actual, recorded in zip(records, manifest['databases']):
+                self.assertEqual(actual['quick_check'], 'ok')
+                self.assertEqual(actual['quick_check_scope'], 'database')
+                self.assertTrue(actual['hash_matches'])
+                self.assertEqual(actual['snapshot_sha256'], recorded['snapshot_sha256'])
+            self.assertEqual(before, {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in root.rglob('*') if p.is_file()})
+
+    def test_inspection_rejects_valid_but_modified_or_corrupt_database(self):
+        for corruption in (False, True):
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                self.inspection_fixture(root)
+                path = root / 'db/contact/contact.db'
+                if corruption:
+                    path.write_bytes(b'not SQLite')
+                else:
+                    size = path.stat().st_size
+                    with writable(path) as c:
+                        c.execute("UPDATE data SET value='after!'")
+                    self.assertEqual(path.stat().st_size, size)
+                with redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                    q.dispatch(Namespace(command='inspect', decrypted_dir=str(root)))
+
+    def test_inspection_rejects_missing_hash_and_nonempty_plaintext_wal(self):
+        for missing_hash in (False, True):
+            with self.subTest(missing_hash=missing_hash), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                manifest = self.inspection_fixture(root)
+                if missing_hash:
+                    del manifest['databases'][0]['snapshot_sha256']
+                    (root / 'snapshot_manifest.json').write_text(json.dumps(manifest))
+                else:
+                    (root / 'db/contact/contact.db-wal').write_bytes(b'nonempty')
+                with redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                    q.dispatch(Namespace(command='inspect', decrypted_dir=str(root)))
+
+    def test_stable_capture_retries_sidecar_disappearance_on_either_read(self):
+        for suffix in ('-wal', '-shm'):
+            for fail_at in (1, 2):
+                with self.subTest(suffix=suffix, fail_at=fail_at), tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw); source = root / 'source.db'
+                    source.write_bytes(self.page(1)[0])
+                    Path(str(source) + '-wal').write_bytes(self.wal())
+                    Path(str(source) + '-shm').write_bytes(self.shm())
+                    calls = 0
+                    original_read = Path.read_bytes
+                    original_shm = b.read_shm_header
+                    def maybe_disappear(path):
+                        nonlocal calls
+                        if str(path).endswith(suffix):
+                            calls += 1
+                            if calls == fail_at:
+                                raise FileNotFoundError('synthetic sidecar churn')
+                        return original_read(path) if suffix == '-wal' else original_shm(path)
+                    target, method = (Path, 'read_bytes') if suffix == '-wal' else (b, 'read_shm_header')
+                    with patch.object(target, method, maybe_disappear), patch.object(b.time, 'sleep'):
+                        wal, info = b.stable_capture(source, root / 'captured.db')
+                    self.assertEqual(info['capture_attempts'], 2)
+                    self.assertEqual(wal, self.wal())
+                    self.assertEqual(info['wal_index'], self.wal_index())
+                    self.assertEqual((root / 'captured.db').read_bytes(), source.read_bytes())
+
+    def test_sidecar_retries_are_bounded_and_do_not_hide_permission_errors(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); source = root / 'source.db'
+            source.write_bytes(self.page(1)[0])
+            with patch.object(b, 'read_shm_header', side_effect=FileNotFoundError('synthetic churn')) as reader, \
+                 patch.object(b.time, 'sleep'):
+                with self.assertRaisesRegex(RuntimeError, 'remained busy'):
+                    b.stable_capture(source, root / 'captured.db')
+                self.assertEqual(reader.call_count, 12)
+            with patch.object(b, 'read_shm_header', side_effect=PermissionError('synthetic denied')) as reader:
+                with self.assertRaises(PermissionError):
+                    b.stable_capture(source, root / 'captured.db')
+                self.assertEqual(reader.call_count, 1)
+
     def fake_snapshot_one(self, backend, source, dest, *key):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b'synthetic plaintext')

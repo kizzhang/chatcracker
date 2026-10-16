@@ -30,6 +30,8 @@ WAL 检查头、代次、连续校验和及提交边界；存在稳定 WAL-index
 
 所有数据库先写入输出路径旁的唯一临时目录；全部校验通过后，才通过目录重命名发布最终快照。失败或键盘中断会删除临时目录，使原输出路径可用于重试。若系统拒绝清理，错误会明确列出残留临时目录，不能将其视为成功快照。
 
+捕获期间 WAL/SHM 被微信删除或替换时，会将该次捕获视为不稳定并重试，最多尝试 12 次；权限错误等其他读取错误仍会中止。
+
 微信的三个 FTS 库依赖 `MMFtsTokenizer`。标准 SQLite 无法验证其分词器语义时，脚本校验所有物理表和 schema，在 `quick_check_scope` 明确标注范围；聊天正文保留在普通消息库中。逐库稳定捕获不保证整个账号各库属于同一个原子事务；清单记录各库时间，`cross_database_atomic:false`。
 
 ## 查询
@@ -44,6 +46,8 @@ python scripts/wecomcracker.py search --app wechat --decrypted-dir '<快照>' --
 `messages`、`search` 支持包含边界的 Unix 秒 `--since`、`--until`；`search` 也可加 `--conversation-id`。先用 `sessions` 将显示名称解析为准确会话 ID。查询合并普通聊天和公众号各分片，按时间从新到旧返回，同秒消息按 `sort_seq` 从大到小排序；不需要额外导出索引。
 
 查询仅接受成功的快照，使用不可变只读 SQLite，并拒绝非空明文 WAL。输出含 `complete`、`wal_processed`、消息来源库和表、`local_id`、`server_id`、发送者、UTC 时间、正文与解析状态。文件传输密钥和类似令牌在文本输出中遮盖。`scanned_unresolved_messages` 表示扫描中未解出的正文，不能把空解析当成不存在消息。
+
+`inspect` 会重新执行不可变只读完整性检查，并将每个数据库的当前 SHA-256 与快照清单核对；损坏、修改、缺少记录哈希或存在非空明文 WAL 时拒绝报告成功。`quick_check_scope` 来自本次实际检查；微信专用 FTS 库仍明确标注物理表检查范围。若压缩备用正文未能解析，消息保留 `compress_content:..._unresolved` 状态，并计入未解析消息数量，即使未恢复出文本。
 
 ## 数据模型与整理
 
