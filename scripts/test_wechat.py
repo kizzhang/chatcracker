@@ -622,7 +622,9 @@ class WeChatTests(unittest.TestCase):
                      '<aeskey><![CDATA[]x]SECRET]]></aeskey>',               # ] inside CDATA value
                      '<aeskey >SYNTH_SECRET</aeskey>',                       # whitespace before >
                      '<aeskey attr="1">SYNTH_SECRET</aeskey>',              # attribute in opening tag
-                     '<password><![CDATA[p<a<ssSECRET]]></password>'):       # < inside CDATA body
+                     '<password><![CDATA[p<a<ssSECRET]]></password>',        # < inside CDATA body
+                     '<img aeskey=&quot;entSECRET&quot;/>',                  # HTML-entity-quoted attribute
+                     'aeskey=\\"escSECRET\\"'):                              # backslash-escaped quotes
             self.assertNotIn('SECRET', q.redact(text), text)
         # tags whose name merely starts with a sensitive word must be left intact
         for keep in ('<aeskeyring>door</aeskeyring>', '<tokenizer>x</tokenizer>'):

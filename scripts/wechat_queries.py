@@ -69,7 +69,9 @@ def redact(text):
     # crosses a delimiter (no over-redaction of surrounding text). A left word boundary
     # keeps a sensitive suffix (hotkey, monkey) from matching.
     text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*["\']?)([^\s,;{}\[\]"\']+)', r'\1[REDACTED]', text)
-    return re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*["\']?)([^\s,;&"\'<>]+)', r'\1[REDACTED]', text)
+    # The opening marker also accepts HTML-entity or backslash-escaped quotes, so a key
+    # written as aeskey=&quot;...&quot; or aeskey=\"...\" is masked, not just the plain form.
+    return re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*(?:&(?:quot|apos|#34|#39);|\\?["\'])?)([^\s,;&"\'<>]+)', r'\1[REDACTED]', text)
 
 
 def decode_content(value):
