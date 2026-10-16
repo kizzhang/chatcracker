@@ -1050,10 +1050,17 @@ def _parse_message_content(raw: object) -> str:
 def _timestamp_to_utc_iso(value: object) -> Optional[str]:
     if value in (None, "", 0):
         return None
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
     while abs(numeric) > 32_503_680_000:
         numeric /= 1000
-    return datetime.fromtimestamp(numeric, timezone.utc).isoformat()
+    try:
+        return datetime.fromtimestamp(numeric, timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        # Out-of-range or negative timestamps must not abort the whole query.
+        return None
 
 
 def _load_user_names(directory: Path) -> dict[str, str]:

@@ -27,6 +27,9 @@ _SENSITIVE_CORE = (r'(?:cdn[a-z_]{0,30}key|aeskey|authkey|filekey|file_key|sessi
                    r'pass_ticket|token|ticket|key|password|passwd|pwd)')
 SENSITIVE = r'(?:[a-z0-9]{1,32}[_-]){0,6}' + _SENSITIVE_CORE
 
+# Upper bound on a single message's decompressed body; caps a zstd decompression bomb.
+ZSTD_MAX_OUTPUT = 32 * 1024 * 1024
+
 
 def as_text(value):
     """Decode non-UTF-8 TEXT/BLOB columns for display without raising."""
@@ -45,17 +48,20 @@ def username_key(value):
 
 
 def redact(text):
-    # A left word boundary keeps a sensitive suffix (hotkey, monkey) from matching.
-    # Quoted values match their own opening quote as the terminator (with escape
-    # handling) so a value containing the other quote cannot leak its tail.
+    # Quoted values are terminated by their own opening quote, with escapes handled. The
+    # two alternatives are disjoint on backslash, so matching stays linear (no ReDoS), and
+    # crossing the other quote / an embedded newline cannot leak a tail.
     text = re.sub(r'(?i)(\b' + SENSITIVE + r'\s*=\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
+    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
     text = re.sub(r'(?is)(<' + SENSITIVE + r'>).*?(</' + SENSITIVE + r'>)', r'\1[REDACTED]\2', text)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
-    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
-    # JSON value that is a bare number/keyword (unquoted), e.g. {"password":123456}.
-    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*)(?!["\'])([^\s,;{}\[\]"\']+)', r'\1[REDACTED]', text)
-    # Bare, unquoted assignments (token=..., access_token: ...) the patterns above miss.
-    return re.sub(r'(?i)\b(' + SENSITIVE + r')(\s*[:=]\s*)([^\s,;&"\'<>]{4,})', r'\1\2[REDACTED]', text)
+    # Fallbacks for unquoted, numeric, or unterminated-quoted values (e.g. token=abc,
+    # {"password":123456}, aeskey="unterminated). They redact only a run of token
+    # characters, so matching is linear and never crosses a quote, space or newline — no
+    # over-redaction of surrounding text — while still masking a value that lacks a closing
+    # quote. A left word boundary keeps a sensitive suffix (hotkey, monkey) from matching.
+    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*["\']?)([A-Za-z0-9+/_.=\-]+)', r'\1[REDACTED]', text)
+    return re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*["\']?)([A-Za-z0-9+/_.=\-]{4,})', r'\1[REDACTED]', text)
 
 
 def decode_content(value):
@@ -68,11 +74,14 @@ def decode_content(value):
     status = 'utf8'
     if value.startswith(b'\x28\xb5\x2f\xfd'):
         try:
-            from compression import zstd
+            from compression.zstd import ZstdDecompressor
         except ImportError as error:
             raise RuntimeError('个人微信压缩消息需要 Python 3.14 的 compression.zstd') from error
         try:
-            value = zstd.decompress(value)
+            decompressor = ZstdDecompressor()
+            value = decompressor.decompress(value, max_length=ZSTD_MAX_OUTPUT)
+            if not decompressor.eof:
+                return '', 'zstd_unresolved'  # output exceeds the cap; refuse a bomb
             status = 'zstd'
         except Exception:
             return '', 'zstd_unresolved'

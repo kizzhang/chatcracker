@@ -583,14 +583,16 @@ class WeChatTests(unittest.TestCase):
             elapsed = time.perf_counter() - start
             self.assertLess(elapsed, 5, f'{label} redact took {elapsed:.2f}s')
 
-    def test_redaction_matches_opening_quote_and_does_not_leak_value_tail(self):
+    def test_redaction_masks_values_without_leaking_tail(self):
         for text in ('{"password":"abc\'defSECRET"}', 'aeskey="abc\'defSECRET"',
                      "authkey='va\"lSECRET'", '{"access_token":"ab\'cdSECRET"}',
-                     'aeskey="ab\\"cdSECRET"', '{"password":123456789}',
-                     '{"token": 987654321}'):
-            self.assertNotIn('SECRET', q.redact(text))
-            self.assertNotIn('123456789', q.redact('{"password":123456789}'))
-            self.assertNotIn('987654321', q.redact('{"token": 987654321}'))
+                     'aeskey="ab\\"cdSECRET"',          # escaped quote inside the value
+                     'aeskey="unterminatedSECRET',      # no closing quote (attr form)
+                     '{"access_token":"untermSECRET',   # no closing quote (json form)
+                     'aeskey="line1\nSECREThidden"'):   # value spans a newline
+            self.assertNotIn('SECRET', q.redact(text), text)
+        self.assertNotIn('123456789', q.redact('{"password":123456789}'))  # numeric value
+        self.assertNotIn('987654321', q.redact('{"token": 987654321}'))
 
     def test_redaction_does_not_over_redact_benign_suffix_fields(self):
         for text in ('hotkey="Ctrl+C"', 'monkey=banana123', '<turnkey>door</turnkey>'):
@@ -615,6 +617,22 @@ class WeChatTests(unittest.TestCase):
             b.emit(success=True, server_id=b'\xff\xfe', note='ok')  # bytes in a numeric field
         data = json.loads(stdout.getvalue())  # must be valid JSON, not a TypeError
         self.assertEqual(data['note'], 'ok')
+
+    def test_zstd_decompression_is_bounded(self):
+        from compression import zstd
+        bomb = zstd.compress(b'A' * (2 * 1024 * 1024))  # 2 MB of 'A' -> tiny blob
+        original = q.ZSTD_MAX_OUTPUT
+        try:
+            q.ZSTD_MAX_OUTPUT = 64 * 1024  # shrink the cap for the test
+            self.assertEqual(q.decode_content(bomb), ('', 'zstd_unresolved'))
+            self.assertEqual(q.decode_content(zstd.compress('会议'.encode())), ('会议', 'zstd'))
+        finally:
+            q.ZSTD_MAX_OUTPUT = original
+
+    def test_out_of_range_timestamp_returns_none_instead_of_raising(self):
+        for bad in (-100000, -99999999999, b'not-a-number', 'x'):
+            self.assertIsNone(wc._timestamp_to_utc_iso(bad))
+        self.assertTrue(wc._timestamp_to_utc_iso(1700000000).startswith('20'))
 
 
 if __name__ == '__main__':
