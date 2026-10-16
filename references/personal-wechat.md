@@ -22,11 +22,13 @@ python scripts/wecomcracker.py decrypt --app wechat `
   --out-dir '<源目录以外的全新目录>' --timeout 120
 ```
 
-脚本拒绝现存输出路径、与源相交的路径和经过重解析点的输出路径。先验证所有库的密钥，随后逐库复制稳定的加密数据库、WAL 与 WAL-index 头，再按 SQLCipher 4 的 4096 字节页进行 AES-256-CBC 解密与 HMAC-SHA512 认证。
+脚本拒绝现存输出路径、与源相交的路径和经过重解析点的输出路径。先验证所有待读取库的密钥，随后逐库复制稳定的加密数据库、WAL 与 WAL-index 头，再按 SQLCipher 4 的 4096 字节页进行 AES-256-CBC 解密与 HMAC-SHA512 认证。仅跳过无进程内密钥、查询不使用的保留库 `migrate/unspportmsg.db`，在清单的 `skipped_databases` 中记录路径与原因；其他数据库仍须全部验证。
 
-WAL 检查头、代次、连续校验和及提交边界；存在稳定 WAL-index 时以其 `mxFrame` 为已提交边界。只应用已提交帧，处理数据库截断，拒绝丢帧或损坏的当前代次。此模式不接受 `--base-only`。
+WAL 检查头、代次、连续校验和及提交边界；存在稳定 WAL-index 时，先将其 `aSalt` 与 WAL 头的 salt 逐字节核对，再以其 `mxFrame` 为已提交边界。代次不一致时拒绝快照，避免把旧代次帧数当作当前提交边界；清单的 `wal_index` 同时保留帧数和代次标识。只应用已提交帧，处理数据库截断，拒绝丢帧或损坏的当前代次。此模式不接受 `--base-only`。
 
 成功要求 `success:true`、`complete:true`、`failed:0`，每库 `quick_check:ok`。结果在 `db/`，清单在 `snapshot_manifest.json`。报告输出路径、`complete` 和 `wal_processed`。
+
+所有数据库先写入输出路径旁的唯一临时目录；全部校验通过后，才通过目录重命名发布最终快照。失败或键盘中断会删除临时目录，使原输出路径可用于重试。若系统拒绝清理，错误会明确列出残留临时目录，不能将其视为成功快照。
 
 微信的三个 FTS 库依赖 `MMFtsTokenizer`。标准 SQLite 无法验证其分词器语义时，脚本校验所有物理表和 schema，在 `quick_check_scope` 明确标注范围；聊天正文保留在普通消息库中。逐库稳定捕获不保证整个账号各库属于同一个原子事务；清单记录各库时间，`cross_database_atomic:false`。
 
@@ -39,7 +41,7 @@ python scripts/wecomcracker.py messages --app wechat --decrypted-dir '<快照>' 
 python scripts/wecomcracker.py search --app wechat --decrypted-dir '<快照>' --keyword '待办' --limit 100
 ```
 
-`messages`、`search` 支持包含边界的 Unix 秒 `--since`、`--until`；`search` 也可加 `--conversation-id`。先用 `sessions` 将显示名称解析为准确会话 ID。查询合并普通聊天和公众号各分片，按时间从新到旧返回；不需要额外导出索引。
+`messages`、`search` 支持包含边界的 Unix 秒 `--since`、`--until`；`search` 也可加 `--conversation-id`。先用 `sessions` 将显示名称解析为准确会话 ID。查询合并普通聊天和公众号各分片，按时间从新到旧返回，同秒消息按 `sort_seq` 从大到小排序；不需要额外导出索引。
 
 查询仅接受成功的快照，使用不可变只读 SQLite，并拒绝非空明文 WAL。输出含 `complete`、`wal_processed`、消息来源库和表、`local_id`、`server_id`、发送者、UTC 时间、正文与解析状态。文件传输密钥和类似令牌在文本输出中遮盖。`scanned_unresolved_messages` 表示扫描中未解出的正文，不能把空解析当成不存在消息。
 

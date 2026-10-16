@@ -207,7 +207,7 @@ def query_messages(args, directory):
                     filters.append('create_time>=?'); parameters.append(lower_bound)
                 if args.until is not None:
                     filters.append('create_time<=?'); parameters.append(args.until)
-                sql = 'SELECT * FROM ' + quote(table) + (' WHERE ' + ' AND '.join(filters) if filters else '') + ' ORDER BY create_time DESC,local_id DESC'
+                sql = 'SELECT * FROM ' + quote(table) + (' WHERE ' + ' AND '.join(filters) if filters else '') + ' ORDER BY create_time DESC,sort_seq DESC,local_id DESC'
                 for row in conn.execute(sql, parameters):
                     if len(heap) == args.limit and (row['create_time'] or 0) < heap[0][0]:
                         break
@@ -234,10 +234,11 @@ def query_messages(args, directory):
                         'source_db': shard.name, 'source_table': table,
                     }
                     serial += 1
-                    heapq.heappush(heap, (row['create_time'] or 0, serial, record))
+                    heapq.heappush(heap, (row['create_time'] or 0, row['sort_seq'] or 0,
+                                          row['local_id'] or 0, shard.name, table, serial, record))
                     if len(heap) > args.limit:
                         heapq.heappop(heap)
-    records = [item[2] for item in sorted(heap, reverse=True)]
+    records = [item[-1] for item in sorted(heap, reverse=True)]
     backend.emit(success=True, app='wechat', **status, messages=records, count=len(records), scanned_unresolved_messages=unresolved)
     return 0
 

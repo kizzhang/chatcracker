@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import tempfile
 import time
 
 import wecomcracker as wc
@@ -208,10 +209,10 @@ def stable_capture(source, dest):
         shm_after = read_shm_header(shm_path)
         after = stat_signature(source)
         if before == after and wal_before == wal_after and shm_before == shm_after:
-            frame_count = wal_index_frame_count(shm_before)
+            wal_index = wal_index_state(shm_before)
             with dest.open('rb') as f:
                 digest = hashlib.file_digest(f, 'sha256').hexdigest()
-            return wal_before, {'captured_at': now(), 'source_bytes': before[0], 'source_mtime_ns': before[1], 'wal_bytes': len(wal_before), 'wal_index_frames': frame_count, 'capture_attempts': attempt+1, 'encrypted_copy_sha256': digest}
+            return wal_before, {'captured_at': now(), 'source_bytes': before[0], 'source_mtime_ns': before[1], 'wal_bytes': len(wal_before), 'wal_index_frames': wal_index['frames'] if wal_index else None, 'wal_index': wal_index, 'capture_attempts': attempt+1, 'encrypted_copy_sha256': digest}
         time.sleep(0.15)
     raise RuntimeError('Source remained busy during stable snapshot capture: ' + source.name)
 
@@ -221,7 +222,7 @@ def read_shm_header(path):
     with path.open('rb') as f:
         return f.read(96)
 
-def wal_index_frame_count(header):
+def wal_index_state(header):
     if not header:
         return None
     if len(header) != 96 or header[:48] != header[48:96]:
@@ -231,7 +232,8 @@ def wal_index_frame_count(header):
         raise RuntimeError('Unsupported WAL index header')
     if checksum(header[:40], '<') != struct.unpack_from('<II', header, 40):
         raise RuntimeError('WAL index checksum failed')
-    return frames
+    # aSalt is an exact byte copy of the corresponding WAL header salt.
+    return {'frames': frames, 'salt': header[32:40].hex()}
 
 def checksum(data, endian, state=(0, 0)):
     values = struct.unpack(endian + str(len(data)//4) + 'I', data)
@@ -241,7 +243,8 @@ def checksum(data, endian, state=(0, 0)):
         b = (b + values[index+1] + a) & 0xffffffff
     return a, b
 
-def committed_wal(wal, aes, mkey, expected_frames=None):
+def committed_wal(wal, aes, mkey, wal_index=None):
+    expected_frames = wal_index['frames'] if wal_index is not None else None
     metadata = {'wal_processed': True, 'valid_frames': 0, 'applied_frames': 0, 'committed_pages': None, 'tail': 'none'}
     if not wal:
         if expected_frames:
@@ -257,6 +260,8 @@ def committed_wal(wal, aes, mkey, expected_frames=None):
     if state != struct.unpack_from('>II', wal, 24):
         raise RuntimeError('WAL header checksum failed')
     salt = wal[16:24]
+    if wal_index is not None and wal_index['salt'] != salt.hex():
+        raise RuntimeError('WAL index generation disagrees with WAL header')
     frames = []
     committed = 0
     mode = None
@@ -332,7 +337,7 @@ def snapshot_one(backend, source, dest, key, salt):
                     out.write(page_decrypt(aes, page, number))
                     authenticated += 1
                 number += 1
-        frames, wal_info = committed_wal(wal, aes, mkey, info['wal_index_frames'])
+        frames, wal_info = committed_wal(wal, aes, mkey, info['wal_index'])
         with dest.open('r+b') as out:
             for number, page in frames:
                 out.seek((number-1)*PAGE)
@@ -378,41 +383,56 @@ def snapshot(args):
         raise ValueError('个人微信会校验并合并 WAL，不支持 --base-only')
     if not (source / 'contact/contact.db').is_file() or not (source / 'session/session.db').is_file():
         raise ValueError('--db-dir 必须指向个人微信账号的 db_storage 目录')
-    files = {p.relative_to(source).as_posix(): p for p in sorted(source.rglob('*.db'))}
+    files = {}
+    skipped = []
+    for path in sorted(source.rglob('*.db')):
+        rel = path.relative_to(source).as_posix()
+        if rel.casefold() == 'migrate/unspportmsg.db':
+            skipped.append({'relative_path': rel, 'reason': 'reserved_unsupported_message_database_without_in_memory_key'})
+        else:
+            files[rel] = path
     if not files or any(path.stat().st_size < PAGE or path.stat().st_size % PAGE for path in files.values()):
         raise ValueError('存在空数据库或非完整的 4096 字节页')
     keys = recover(files, timeout=args.timeout, verbose=args.verbose)
     if len(keys) != len(files):
         missing = [name for name in files if name not in keys]
         raise RuntimeError('无法校验全部数据库；请确认当前账号已登录且目录正确：' + ', '.join(missing))
-    out.mkdir(parents=True, exist_ok=False)
     manifest = {
         'format': 'wechat-local-snapshot-v1', 'app': 'wechat',
         'source': str(source), 'output': str(out), 'started_at': now(),
         'success': False, 'complete': False, 'wal_processed': True,
         'third_party_dependencies': 0, 'keys_persisted': False,
         'cross_database_atomic': False, 'databases': [], 'failed': 0,
+        'skipped_databases': skipped,
     }
-    manifest_path = out / 'snapshot_manifest.json'
-    with wc.WindowsAesCbc() as backend:
-        wc.cng_self_test(backend)
-        cng256_test(backend)
-        for rel, path in files.items():
-            try:
-                info = snapshot_one(backend, path, out / 'db' / rel, *keys[rel])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f'.{out.name}.staging-', dir=out.parent))
+    try:
+        with wc.WindowsAesCbc() as backend:
+            wc.cng_self_test(backend)
+            cng256_test(backend)
+            for rel, path in files.items():
+                try:
+                    info = snapshot_one(backend, path, staging / 'db' / rel, *keys[rel])
+                except Exception as error:
+                    raise RuntimeError(f'{rel}: {error}') from error
                 info['relative_path'] = rel
                 manifest['databases'].append(info)
                 if args.verbose:
                     emit(event='snapshot_verified', database=rel, wal_frames=info['applied_frames'])
-            except Exception as error:
-                manifest['failed'] += 1
-                manifest['databases'].append({'relative_path': rel, 'error': str(error)})
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
-    manifest.update(finished_at=now(), success=manifest['failed'] == 0,
-                    complete=manifest['failed'] == 0, wal_processed=manifest['failed'] == 0)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
-    emit(success=manifest['success'], app='wechat', complete=manifest['complete'],
-         wal_processed=manifest['wal_processed'], failed=manifest['failed'],
+        manifest.update(finished_at=now(), success=True, complete=True, wal_processed=True)
+        (staging / 'snapshot_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        # On Windows rename refuses a destination created by another process.
+        staging.rename(out)
+    except BaseException as error:
+        try:
+            shutil.rmtree(staging)
+        except OSError as cleanup_error:
+            raise RuntimeError(f'快照创建失败（{type(error).__name__}: {error}）；明文暂存目录清理失败，需要处理：{staging}') from cleanup_error
+        raise
+    manifest_path = out / 'snapshot_manifest.json'
+    emit(success=True, app='wechat', complete=True,
+         wal_processed=True, failed=0,
          database_count=len(files), third_party_dependencies=0, keys_persisted=False,
          output_dir=str(out), manifest=str(manifest_path))
-    return 0 if manifest['success'] else 1
+    return 0
