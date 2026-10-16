@@ -9,7 +9,7 @@ from __future__ import annotations
 from contextlib import closing
 import csv
 import ctypes
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -290,6 +290,12 @@ def committed_wal(wal, aes, mkey, wal_index=None):
     for offset in range(32, stop, 4120):
         header = wal[offset:offset+24]
         if header[8:16] != salt:
+            # A valid WAL holds the current generation's frames first and only stale
+            # leftovers at the tail. A current-salt frame after this point means the WAL
+            # is inconsistent (e.g. a corrupted salt), so refuse it rather than silently
+            # dropping committed frames while still reporting the snapshot complete.
+            if any(wal[later+8:later+16] == salt for later in range(offset+4120, stop, 4120)):
+                raise RuntimeError('WAL frame salt is inconsistent; refusing possibly-corrupt WAL')
             metadata['tail'] = 'stale_generation'
             break
         number, commit_size = struct.unpack_from('>II', header)
@@ -405,12 +411,14 @@ def snapshot_one(backend, source, dest, key, salt):
 
 
 def snapshot(args):
+    if args.base_only:
+        raise ValueError('个人微信会校验并合并 WAL，不支持 --base-only')
     source = Path(args.db_dir).resolve()
     out = Path(args.out_dir).absolute()
     wc.assert_safe_output(source, out)
-    if args.base_only:
-        raise ValueError('个人微信会校验并合并 WAL，不支持 --base-only')
-    if not (source / 'contact/contact.db').is_file() or not (source / 'session/session.db').is_file():
+    # Require message/ too, so a directory that snapshots cannot later be queried
+    # (db_root/is_account_db also require it) fails early with a clear message.
+    if not (source / 'contact/contact.db').is_file() or not (source / 'session/session.db').is_file() or not (source / 'message').is_dir():
         raise ValueError('--db-dir 必须指向个人微信账号的 db_storage 目录')
     files = {}
     skipped = []

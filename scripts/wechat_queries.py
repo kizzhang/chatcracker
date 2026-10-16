@@ -56,7 +56,7 @@ def redact(text):
     # Redact the token run right after an opening sensitive tag, allowing an optional
     # CDATA wrapper. Matching the value (not the closing tag) keeps it linear — an
     # unmatched <token> run cannot rescan the text — and still reaches keys inside CDATA.
-    text = re.sub(r'(?i)(<' + SENSITIVE + r'>\s*(?:<!\[CDATA\[\s*)?)([A-Za-z0-9+/_.=\-]+)', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)(<' + SENSITIVE + r'>\s*(?:<!\[CDATA\[\s*)?)([^<\]]+)', r'\1[REDACTED]', text)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
     # Fallbacks for unquoted, numeric, or unterminated-quoted values (e.g. token=abc,
     # {"password":123456}, aeskey="unterminated, password=p@ssw0rd!). The value runs to the
@@ -166,7 +166,11 @@ def discover(data_root=None):
                 found.add(parent.resolve())
             if is_account_db(parent / 'db_storage'):
                 found.add((parent / 'db_storage').resolve())
-            for account in parent.iterdir():
+            try:
+                children = list(parent.iterdir())
+            except OSError:
+                continue  # an unreadable root must not abort the whole discovery
+            for account in children:
                 if account.is_dir() and is_account_db(account / 'db_storage'):
                     found.add((account / 'db_storage').resolve())
     return sorted(found)

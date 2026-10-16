@@ -108,10 +108,18 @@ class WeChatTests(unittest.TestCase):
         self.assertEqual(b.committed_wal(wal, self.aes, self.mkey, self.wal_index(0))[0], [])
         with self.assertRaises(RuntimeError):
             b.committed_wal(wal, self.aes, self.mkey, self.wal_index(3))
-        stale = bytearray(wal); stale[40:48] = b'OLD12345'
-        self.assertEqual(b.committed_wal(stale, self.aes, self.mkey)[0], [])
+        # frame 1 stale while 2 and 3 are current is impossible in a valid WAL: refuse it
+        # as corrupt rather than silently dropping the current committed frames.
+        corrupt = bytearray(wal); corrupt[40:48] = b'OLD12345'
         with self.assertRaises(RuntimeError):
-            b.committed_wal(stale, self.aes, self.mkey, self.wal_index(2))
+            b.committed_wal(corrupt, self.aes, self.mkey)
+        with self.assertRaises(RuntimeError):
+            b.committed_wal(corrupt, self.aes, self.mkey, self.wal_index(2))
+        # a genuinely stale tail (every frame from an older generation) yields no frames
+        fully_stale = bytearray(wal)
+        for off in range(40, len(wal), 4120):
+            fully_stale[off:off+8] = b'OLD12345'
+        self.assertEqual(b.committed_wal(fully_stale, self.aes, self.mkey)[0], [])
 
     def test_stale_wal_index_cannot_silently_truncate_a_committed_wal(self):
         wal = self.wal(commit_at=(2, 3))
@@ -594,7 +602,9 @@ class WeChatTests(unittest.TestCase):
                      'password=p@ss!w0rdSECRET',        # punctuation in an unquoted value
                      '{"password":p@SECRET!}',          # punctuation in an unquoted json value
                      '<aeskey><![CDATA[0123456789abcdefSECRET]]></aeskey>',  # key inside CDATA
-                     '<filekey>plainSECRETkey</filekey>'):                   # plain tag body
+                     '<filekey>plainSECRETkey</filekey>',                    # plain tag body
+                     '<password>p@ss!w0rdSECRET</password>',                 # punctuation in a tag
+                     '<aeskey><![CDATA[\nab!c\nSECRET\n]]></aeskey>'):       # punctuation + newlines
             self.assertNotIn('SECRET', q.redact(text), text)
         self.assertNotIn('123456789', q.redact('{"password":123456789}'))  # numeric value
         self.assertNotIn('987654321', q.redact('{"token": 987654321}'))
@@ -657,6 +667,18 @@ class WeChatTests(unittest.TestCase):
         data = json.loads(stdout.getvalue())
         self.assertTrue(data['success'] and data['elevated'])
         self.assertIsNone(data['same_session_weixin_process_count'])
+
+    def test_snapshot_requires_message_directory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); source = root / 'source'
+            for name in ('contact/contact.db', 'session/session.db'):  # no message/ dir
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(bytes(b.PAGE))
+            args = Namespace(db_dir=str(source), out_dir=str(root / 'out'), base_only=False, timeout=1, verbose=False)
+            with patch.object(b, 'recover', side_effect=AssertionError('must not scan')), \
+                 self.assertRaisesRegex(ValueError, 'db_storage'):
+                b.snapshot(args)
 
 
 if __name__ == '__main__':
