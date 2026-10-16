@@ -573,11 +573,12 @@ class WeChatTests(unittest.TestCase):
                 json.loads(stdout.getvalue())  # valid JSON ⇒ no bytes leaked into output
 
     def test_redaction_is_not_pathologically_slow(self):
-        # Each input targets a different quantifier: the bounded prefix (alnum run),
-        # the cdn core, and the escaped-quoted-value alternation (backslash bomb with
-        # no closing quote). All must stay far from the pre-fix multi-second blowups.
+        # Each input targets a different quantifier: the bounded prefix (alnum run), the
+        # cdn core, the escaped-quoted-value alternation (backslash bomb, no close), and
+        # the XML tag body (unmatched <token> run). All must stay far from the multi-second
+        # blowups each construct produced before being bounded/unrolled.
         for label, blob in (('alnum', 'A1' * 60000), ('cdn', 'cdn' * 60000),
-                            ('backslash', 'aeskey="' + chr(92) * 400)):
+                            ('backslash', 'aeskey="' + chr(92) * 400), ('xmltag', '<token>' * 40000)):
             start = time.perf_counter()
             q.redact(blob)
             elapsed = time.perf_counter() - start
@@ -589,10 +590,13 @@ class WeChatTests(unittest.TestCase):
                      'aeskey="ab\\"cdSECRET"',          # escaped quote inside the value
                      'aeskey="unterminatedSECRET',      # no closing quote (attr form)
                      '{"access_token":"untermSECRET',   # no closing quote (json form)
-                     'aeskey="line1\nSECREThidden"'):   # value spans a newline
+                     'aeskey="line1\nSECREThidden"',    # value spans a newline
+                     'password=p@ss!w0rdSECRET',        # punctuation in an unquoted value
+                     '{"password":p@SECRET!}'):         # punctuation in an unquoted json value
             self.assertNotIn('SECRET', q.redact(text), text)
         self.assertNotIn('123456789', q.redact('{"password":123456789}'))  # numeric value
         self.assertNotIn('987654321', q.redact('{"token": 987654321}'))
+        self.assertEqual(q.redact('token=abc'), 'token=[REDACTED]')  # short value still masked
 
     def test_redaction_does_not_over_redact_benign_suffix_fields(self):
         for text in ('hotkey="Ctrl+C"', 'monkey=banana123', '<turnkey>door</turnkey>'):
