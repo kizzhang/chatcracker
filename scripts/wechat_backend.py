@@ -209,6 +209,9 @@ def stat_signature(path):
     st = path.stat()
     return (st.st_size, st.st_mtime_ns)
 
+class WalIndexChanging(RuntimeError):
+    """The two WAL-index header copies disagree (SQLite is mid-update); retry."""
+
 def stable_capture(source, dest):
     wal_path = Path(str(source) + '-wal')
     shm_path = Path(str(source) + '-shm')
@@ -226,7 +229,12 @@ def stable_capture(source, dest):
             continue
         after = stat_signature(source)
         if before == after and wal_before == wal_after and shm_before == shm_after:
-            wal_index = wal_index_state(shm_before)
+            try:
+                wal_index = wal_index_state(shm_before)
+            except WalIndexChanging:
+                # Both header copies were read in the same half-updated state; retry.
+                time.sleep(0.15)
+                continue
             with dest.open('rb') as f:
                 digest = hashlib.file_digest(f, 'sha256').hexdigest()
             return wal_before, {'captured_at': now(), 'source_bytes': before[0], 'source_mtime_ns': before[1], 'wal_bytes': len(wal_before), 'wal_index_frames': wal_index['frames'] if wal_index else None, 'wal_index': wal_index, 'capture_attempts': attempt+1, 'encrypted_copy_sha256': digest}
@@ -243,7 +251,7 @@ def wal_index_state(header):
     if not header:
         return None
     if len(header) != 96 or header[:48] != header[48:96]:
-        raise RuntimeError('WAL index is changing or truncated; retry snapshot')
+        raise WalIndexChanging('WAL index is changing or truncated; retry snapshot')
     version, _, _, initialized, _, page_size, frames, _ = struct.unpack_from('<IIIBBHII', header)
     if version != 3007000 or initialized != 1 or not (page_size == PAGE or (page_size == 0 and frames == 0)):
         raise RuntimeError('Unsupported WAL index header')
@@ -323,6 +331,11 @@ def committed_wal(wal, aes, mkey, wal_index=None):
     metadata['checksum_mode'] = mode
     metadata['uncommitted_frames_ignored'] = len(frames)-committed
     metadata['trailing_bytes'] = max(0, len(wal)-32) % 4120
+    if expected_frames is None and metadata['trailing_bytes']:
+        # Without a WAL index we cannot tell whether a partial trailing frame held a
+        # committed transaction, so refuse rather than publish a possibly-incomplete
+        # snapshot as complete. (The real decrypt flow always has a WAL index.)
+        raise RuntimeError('WAL has a partial trailing frame; cannot confirm completeness without a WAL index')
     if expected_frames is not None and (len(frames) != expected_frames or committed != expected_frames):
         raise RuntimeError('WAL commit boundary disagrees with stable WAL index')
     return frames[:committed], metadata
@@ -457,6 +470,10 @@ def snapshot(args):
                 manifest['databases'].append(info)
                 if args.verbose:
                     emit(event='snapshot_verified', database=rel, wal_frames=info['applied_frames'])
+        # Preserve the account layout even when a subtree has no databases (e.g. an empty
+        # message/), so the published snapshot stays queryable (is_account_db needs them).
+        for required in ('contact', 'session', 'message'):
+            (staging / 'db' / required).mkdir(parents=True, exist_ok=True)
         manifest.update(finished_at=now(), success=True, complete=True, wal_processed=True)
         (staging / 'snapshot_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
         # On Windows rename refuses a destination created by another process.

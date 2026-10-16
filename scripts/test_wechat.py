@@ -120,6 +120,9 @@ class WeChatTests(unittest.TestCase):
         for off in range(40, len(wal), 4120):
             fully_stale[off:off+8] = b'OLD12345'
         self.assertEqual(b.committed_wal(fully_stale, self.aes, self.mkey)[0], [])
+        # a partial trailing frame without a WAL index cannot be confirmed complete
+        with self.assertRaisesRegex(RuntimeError, 'partial trailing'):
+            b.committed_wal(bytes(wal) + bytes(100), self.aes, self.mkey)
 
     def test_stale_wal_index_cannot_silently_truncate_a_committed_wal(self):
         wal = self.wal(commit_at=(2, 3))
@@ -604,7 +607,9 @@ class WeChatTests(unittest.TestCase):
                      '<aeskey><![CDATA[0123456789abcdefSECRET]]></aeskey>',  # key inside CDATA
                      '<filekey>plainSECRETkey</filekey>',                    # plain tag body
                      '<password>p@ss!w0rdSECRET</password>',                 # punctuation in a tag
-                     '<aeskey><![CDATA[\nab!c\nSECRET\n]]></aeskey>'):       # punctuation + newlines
+                     '<aeskey><![CDATA[\nab!c\nSECRET\n]]></aeskey>',        # punctuation + newlines
+                     '<password>]bracketSECRET</password>',                 # ] is a value char, not a terminator
+                     '<aeskey><![CDATA[]x]SECRET]]></aeskey>'):              # ] inside CDATA value
             self.assertNotIn('SECRET', q.redact(text), text)
         self.assertNotIn('123456789', q.redact('{"password":123456789}'))  # numeric value
         self.assertNotIn('987654321', q.redact('{"token": 987654321}'))
@@ -680,6 +685,36 @@ class WeChatTests(unittest.TestCase):
             with patch.object(b, 'recover', side_effect=AssertionError('must not scan')), \
                  self.assertRaisesRegex(ValueError, 'db_storage'):
                 b.snapshot(args)
+
+    def test_stable_capture_retries_transiently_inconsistent_wal_index(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); source = root / 'source.db'
+            source.write_bytes(self.page(1)[0])
+            Path(str(source) + '-wal').write_bytes(self.wal())
+            bad = self.shm(2)[:48] + self.shm(3)[:48]  # the two header copies disagree
+            good = self.shm(2)
+            with patch.object(b, 'read_shm_header', side_effect=[bad, bad, good, good]), \
+                 patch.object(b.time, 'sleep'):
+                wal, info = b.stable_capture(source, root / 'copy.db')
+            self.assertEqual(info['capture_attempts'], 2)
+            self.assertEqual(info['wal_index'], self.wal_index(2))
+
+    def test_snapshot_keeps_message_dir_so_empty_account_stays_queryable(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); source = root / 'source'
+            for name in ('contact/contact.db', 'session/session.db'):
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(bytes(b.PAGE))
+            (source / 'message').mkdir()  # present but empty
+            args = Namespace(db_dir=str(source), out_dir=str(root / 'snap'), base_only=False, timeout=1, verbose=False)
+            keys = {p.relative_to(source).as_posix(): (self.key, self.salt) for p in source.rglob('*.db')}
+            with patch.object(b, 'recover', return_value=keys), \
+                 patch.object(b, 'snapshot_one', side_effect=self.fake_snapshot_one), redirect_stdout(io.StringIO()):
+                self.assertEqual(b.snapshot(args), 0)
+            out = Path(args.out_dir)
+            self.assertTrue((out / 'db' / 'message').is_dir())
+            self.assertEqual(q.db_root(out), out / 'db')  # queryable: no 缺少 db/message error
 
 
 if __name__ == '__main__':

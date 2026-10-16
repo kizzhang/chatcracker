@@ -56,7 +56,7 @@ def redact(text):
     # Redact the token run right after an opening sensitive tag, allowing an optional
     # CDATA wrapper. Matching the value (not the closing tag) keeps it linear — an
     # unmatched <token> run cannot rescan the text — and still reaches keys inside CDATA.
-    text = re.sub(r'(?i)(<' + SENSITIVE + r'>\s*(?:<!\[CDATA\[\s*)?)([^<\]]+)', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)(<' + SENSITIVE + r'>\s*(?:<!\[CDATA\[\s*)?)([^<]+)', r'\1[REDACTED]', text)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
     # Fallbacks for unquoted, numeric, or unterminated-quoted values (e.g. token=abc,
     # {"password":123456}, aeskey="unterminated, password=p@ssw0rd!). The value runs to the
