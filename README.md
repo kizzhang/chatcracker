@@ -1,12 +1,51 @@
 <p align="center">
-  <img src="assets/icon-b-clean-wecom-256.png" alt="WeComCracker logo" width="220">
+  <img src="assets/icon-chatcracker-256.png" alt="ChatCracker logo" width="180">
 </p>
 
-# WeComCracker：微信与企微记录回溯
+# ChatCracker
 
-WeComCracker 是一个给 Codex 使用的微信与企微记录回溯 Skill。它从当前 Windows 用户自己的本地聊天中，整理有证据的工作与生活时间线、任务、承诺、交付物和待跟进事项，并生成可审阅的项目交接预览。
+**从聊天记录中，找回上下文、承诺与下一步。**
 
-个人微信 4.x 使用 SQLCipher 4，企微使用 wxSQLite3。两者共用 `scripts/wecomcracker.py` 入口；不带 `--app` 的现有命令保持企微行为。
+ChatCracker 是一个以本地聊天记录为基础的个人记忆与回顾工具，通过 Codex Skill 使用。它帮助你回顾工作与生活，找出做过的决定、答应过的事、尚未闭环的跟进，并让每个结论都能追溯到原始对话。
+
+目前支持 Windows 上的**个人微信 4.x 和企业微信**。项目的方向是用统一的读取、查询与证据结构逐步接入更多聊天来源；其他平台尚未实现。
+
+> ChatCracker 是项目的新品牌名称。当前 GitHub 仓库、Skill 标识与命令入口仍沿用 `wecomcracker`；下方安装链接和命令可按原名称使用。
+
+## 可以用它做什么
+
+- **回顾工作与生活**：按时间、人物和主题整理近期对话，找回事情的来龙去脉。
+- **找出待跟进事项**：梳理任务、承诺、截止时间、阻塞和等待回复的事情。
+- **找回决策依据**：定位谁提出了什么、何时确认、后来是否发生变化。
+- **准备项目交接**：生成带消息证据的任务与关系预览，供你审阅。
+
+例如，你可以直接告诉 Codex：
+
+```text
+使用 $wecomcracker 整理我最近两个月的聊天记录，给我工作与生活全景，重点列出待跟进事项，并附上聊天证据。
+```
+
+## 当前支持
+
+| 来源 | 读取方式 | 环境与范围 |
+| --- | --- | --- |
+| 个人微信 | `--app wechat` | 个人微信 4.x，64 位 Windows，Python 3.14 |
+| 企业微信 | `--app wecom`，也可省略该选项 | 64 位 Windows，已登录的企业微信，Python |
+
+只读取当前用户自己的本地记录，使用 Python 标准库与 Windows CNG，不安装第三方 Python 依赖。个人微信使用 SQLCipher 4，企微使用 wxSQLite3；两者共用 `scripts/wecomcracker.py` 入口。
+
+## 安装
+
+将项目安装到个人 Codex Skills 目录：
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex\skills" | Out-Null
+
+git clone https://github.com/kizzhang/wecomcracker.git `
+  "$env:USERPROFILE\.codex\skills\wecomcracker"
+```
+
+以下命令在项目目录下运行。创建快照时，保持对应客户端已登录并运行。
 
 ## 个人微信快速开始
 
@@ -24,11 +63,9 @@ python scripts/wecomcracker.py search --app wechat --decrypted-dir '<快照目�
 
 支持自定义数据根目录、逐库密钥验证、已提交 WAL 合并、只读查询和跨分片发送者关联。已在 Windows 微信 4.1.15.51 验证；当前不支持个人微信 3.x。完整说明见 [个人微信读取](references/personal-wechat.md)。
 
-它只使用 Python 标准库与 Windows CNG，不依赖第三方 Python 包；当企业微信 API 或 CLI 无法提供足够长的历史记录时，可读取本机 wxSQLite3 数据库快照。
-
 ## 只读取自己的本地数据
 
-WeComCracker 只面向当前 Windows 用户自己的微信或企微账号，以及用户明确授权查看的本地文件。请勿用于读取其他人的账号、远程机器，绕过 Windows 权限，转储进程内存，或发送消息。数据库密钥不输出、不缓存、不上传；明文快照只写到明确指定的独立目录。
+ChatCracker 只面向当前 Windows 用户自己的微信或企微账号，以及用户明确授权查看的本地文件。请勿用于读取其他人的账号、远程机器，绕过 Windows 权限，转储进程内存，或发送消息。数据库密钥不输出、不缓存、不上传；明文快照只写到明确指定的独立目录。
 
 本版本只生成供用户审阅的工作摘要和 `not_synced` 项目交接预览，不会直接向 Vikunja、Microsoft Project 或其他项目系统写入任务。
 
@@ -36,16 +73,7 @@ WeComCracker 只面向当前 Windows 用户自己的微信或企微账号，以�
 
 推荐环境：64 位 Windows、已登录并保持运行的企业微信、Python，以及 Codex Desktop。
 
-直接安装到个人 Codex Skills 目录：
-
-```powershell
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex\skills" | Out-Null
-
-git clone https://github.com/kizzhang/wecomcracker.git `
-  "$env:USERPROFILE\.codex\skills\wecomcracker"
-```
-
-然后在 Codex 中使用：
+在 Codex 中使用：
 
 ```text
 使用 $wecomcracker 回顾我最近一周的企业微信记录，梳理任务、承诺、截止时间、阻塞和未闭环事项；只生成带证据的审阅预览，不写入外部项目系统。
@@ -103,7 +131,7 @@ python scripts/wecomcracker.py search `
 - 带置信度与证据的任务关系图；
 - 所有事项保持 `not_synced` 的项目管理交接数据。
 
-为兼容已经生成的快照，清单中的格式标识暂时保留为 `wecom-chat-vault-snapshot-v1`。
+快照清单按来源使用独立格式标识：个人微信为 `wechat-local-snapshot-v1`，企微为 `wecom-chat-vault-snapshot-v1`。
 
 ## Skill 入口
 
@@ -120,6 +148,6 @@ python scripts/wecomcracker.py search `
 - 恢复出的数据库密钥只保留在进程内存中，绝不打印或写入磁盘。
 - 加密源数据库只读；明文快照必须写入单独的新目录。
 - 查询使用 SQLite `mode=ro&immutable=1` 和 `PRAGMA query_only=ON`。
-- 默认发现非空源 WAL 时安全中止；只有用户明确接受不完整快照时才使用 `--base-only`。
+- 个人微信会校验并合并已提交 WAL；企微默认发现非空源 WAL 时中止，只有用户明确接受不完整快照时才使用 `--base-only`。
 - 明文快照和提取出的聊天文本都属于敏感数据，不应提交到 GitHub。
 - 附件内容不会因为聊天中解析出文件名而自动被读取。

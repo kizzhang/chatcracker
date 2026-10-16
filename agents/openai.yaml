@@ -1,7 +1,7 @@
 interface:
-  display_name: "WeComCracker"
+  display_name: "ChatCracker"
   short_description: "读取自己的微信与企微本地历史，整理工作生活时间线、承诺与待跟进事项"
-  icon_small: "./assets/icon-b-clean-wecom-128.png"
-  icon_large: "./assets/icon-b-clean-wecom-256.png"
+  icon_small: "./assets/icon-chatcracker-128.png"
+  icon_large: "./assets/icon-chatcracker-256.png"
   brand_color: "#008AE8"
   default_prompt: "使用 $wecomcracker 回顾我自己的微信或企业微信本地记录，整理有证据支持的工作生活时间线和待跟进事项。"
