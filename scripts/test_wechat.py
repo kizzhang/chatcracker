@@ -627,7 +627,10 @@ class WeChatTests(unittest.TestCase):
                      'aeskey=\\"escSECRET\\"',                               # backslash-escaped quotes
                      '<aeskey><![CDATA[aKEY]]><![CDATA[bSECRET]]></aeskey>',  # multiple CDATA sections
                      'password=&quot;alpha beta SECRET&quot;',               # entity-quoted value with spaces
-                     'password=\\"alpha beta SECRET\\"'):                    # escape-quoted value with spaces
+                     'password=\\"alpha beta SECRET\\"',                     # escape-quoted value with spaces
+                     '{"payload":"{\\"access_token\\":\\"nestSECRET\\"}"}',  # nested escaped-JSON key/value
+                     'password=&quot;' + 'A' * 600 + 'tailSECRET&quot;',     # >512 entity-quoted value
+                     '<aeskey>' + 'A' * 600 + 'tailSECRET</aeskey>'):        # >512 tag body
             self.assertNotIn('SECRET', q.redact(text), text)
         # tags whose name merely starts with a sensitive word must be left intact
         for keep in ('<aeskeyring>door</aeskeyring>', '<tokenizer>x</tokenizer>'):
@@ -706,6 +709,23 @@ class WeChatTests(unittest.TestCase):
             with patch.object(b, 'recover', side_effect=AssertionError('must not scan')), \
                  self.assertRaisesRegex(ValueError, 'db_storage'):
                 b.snapshot(args)
+
+    def test_snapshot_aborts_on_unreadable_subdirectory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); source = root / 'source'
+            for name in ('contact/contact.db', 'session/session.db', 'message/message_0.db'):
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(bytes(b.PAGE))
+            args = Namespace(db_dir=str(source), out_dir=str(root / 'out'), base_only=False, timeout=1, verbose=False)
+            def fake_walk(self, top_down=True, on_error=None, follow_symlinks=False):
+                if on_error:
+                    on_error(PermissionError('synthetic directory denied'))  # a listing error must abort
+                return iter(())
+            with patch.object(Path, 'walk', fake_walk), \
+                 patch.object(b, 'recover', side_effect=AssertionError('must not scan')):
+                with self.assertRaises(PermissionError):
+                    b.snapshot(args)
 
     def test_query_rejects_content_modified_snapshot(self):
         with tempfile.TemporaryDirectory() as raw:

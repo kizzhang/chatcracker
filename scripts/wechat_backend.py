@@ -442,7 +442,13 @@ def snapshot(args):
         raise ValueError('--db-dir 必须指向个人微信账号的 db_storage 目录')
     files = {}
     skipped = []
-    for path in sorted(source.rglob('*.db')):
+    def _raise(error):
+        raise error
+    # Walk with on_error=raise: an unreadable subdirectory (e.g. message/) must abort the
+    # snapshot, not be silently skipped by rglob — otherwise shards vanish yet complete:true.
+    db_paths = [dirpath / name for dirpath, _dirs, names in source.walk(on_error=_raise)
+                for name in names if name.endswith('.db')]
+    for path in sorted(db_paths):
         rel = path.relative_to(source).as_posix()
         if rel.casefold() == 'migrate/unspportmsg.db':
             skipped.append({'relative_path': rel, 'reason': 'reserved_unsupported_message_database_without_in_memory_key'})

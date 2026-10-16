@@ -63,18 +63,23 @@ def redact(text):
     text = re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
     # 2. "key":"value"  (JSON, literal quotes)
     text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
-    # 3. key=&quot;value&quot; / key=\"value\"  (entity/escape-encoded quotes, crossing spaces)
-    text = re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*)(&quot;|&apos;|&#34;|&#39;|\\["\'])((?:(?!\2)[^<]){0,512})(\2)', r'\1\2[REDACTED]\4', text)
-    # 4. <tag ...>body</tag>  (whole body up to the closing tag; one or many CDATA sections)
-    text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]{0,200}>)([\s\S]{0,512}?)(</' + SENSITIVE + r'>)', r'\1[REDACTED]\3', text)
+    # 3. key=&quot;value&quot; / key=\"value\"  (entity/escape-encoded quotes, crossing spaces;
+    #    unbounded but linear — single tempered branch, so any-length value is masked whole)
+    text = re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*)(&quot;|&apos;|&#34;|&#39;|\\["\'])((?:(?!\2)[^<])*)(\2)', r'\1\2[REDACTED]\4', text)
+    # 4. <tag ...>body</tag>  (whole body up to the closing tag; one or many CDATA sections).
+    #    Bounded so repeated unmatched opening tags cannot rescan quadratically; the bound
+    #    comfortably exceeds any real key/token, and the fallback (5) still masks a longer body.
+    text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]{0,200}>)([\s\S]{0,2048}?)(</' + SENSITIVE + r'>)', r'\1[REDACTED]\3', text)
     # 5. <tag ...>body  (no closing tag: redact the first content run)
     text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]{0,200}>\s*(?:<!\[CDATA\[)?)([^<]+)', r'\1[REDACTED]', text)
     # 6. ?key=value / &key=value  (URL parameter)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
     # 7. "key":value / "key":123  (JSON, unquoted or numeric value)
     text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*["\']?)([^\s,;{}\[\]"\']+)', r'\1[REDACTED]', text)
-    # 8. key=token  (bare; optional literal/entity/escape opening quote)
-    return re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*(?:&(?:quot|apos|#34|#39);|\\?["\'])?)([^\s,;&"\'<>]+)', r'\1[REDACTED]', text)
+    # 8. key=token  (bare; optional literal/entity/escape quote on either side of the
+    #    separator, so an escaped nested-JSON key like \"token\":\"value\" is also masked)
+    marker = r'(?:&(?:quot|apos|#34|#39);|\\?["\'])?'
+    return re.sub(r'(?i)(\b' + SENSITIVE + marker + r'\s*[:=]\s*' + marker + r')([^\s,;&"\'<>]+)', r'\1[REDACTED]', text)
 
 
 def decode_content(value):
