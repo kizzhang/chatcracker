@@ -47,30 +47,33 @@ def username_key(value):
     return str(value).encode('utf-8')
 
 
+def _num(value):
+    """Numeric sort key; a non-numeric column (malformed data) sorts as 0, never raises."""
+    return value if isinstance(value, (int, float)) else 0
+
+
 def redact(text):
-    # Quoted values are terminated by their own opening quote, with escapes handled. The
-    # two alternatives are disjoint on backslash, so matching stays linear (no ReDoS), and
-    # crossing the other quote / an embedded newline cannot leak a tail.
+    # Mask credential-like VALUES wherever a sensitive label introduces them. Every pattern
+    # is bounded/linear (no catastrophic backtracking). Quoted values are read to their own
+    # closing quote (crossing spaces/newlines, escape-aware) so a tail cannot leak; an XML
+    # tag body is read to its closing tag (covering one or many CDATA sections); token
+    # values run to the next structural delimiter. A left word boundary keeps a benign
+    # suffix (hotkey, monkey, aeskeyring) from matching.
+    # 1. key="value" / key: "value"  (literal quotes)
     text = re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
+    # 2. "key":"value"  (JSON, literal quotes)
     text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
-    # Redact the token run right after an opening sensitive tag, allowing an optional
-    # CDATA wrapper. Matching the value (not the closing tag) keeps it linear — an
-    # unmatched <token> run cannot rescan the text — and still reaches keys inside CDATA.
-    # Sensitive XML tags, tolerating attributes/whitespace in the opening tag. CDATA bodies
-    # may legally contain '<', so they are matched up to ']]>'; a plain body stops at the
-    # next tag. Both match the value (not the closing tag), which keeps them linear.
-    text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]{0,200}>\s*<!\[CDATA\[)([^\]]*(?:\](?!\]>)[^\]]*)*)', r'\1[REDACTED]', text)
-    text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]{0,200}>\s*)([^<]+)', r'\1[REDACTED]', text)
+    # 3. key=&quot;value&quot; / key=\"value\"  (entity/escape-encoded quotes, crossing spaces)
+    text = re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*)(&quot;|&apos;|&#34;|&#39;|\\["\'])((?:(?!\2)[^<]){0,512})(\2)', r'\1\2[REDACTED]\4', text)
+    # 4. <tag ...>body</tag>  (whole body up to the closing tag; one or many CDATA sections)
+    text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]{0,200}>)([\s\S]{0,512}?)(</' + SENSITIVE + r'>)', r'\1[REDACTED]\3', text)
+    # 5. <tag ...>body  (no closing tag: redact the first content run)
+    text = re.sub(r'(?i)(<' + SENSITIVE + r'\b[^>]{0,200}>\s*(?:<!\[CDATA\[)?)([^<]+)', r'\1[REDACTED]', text)
+    # 6. ?key=value / &key=value  (URL parameter)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
-    # Fallbacks for unquoted, numeric, or unterminated-quoted values (e.g. token=abc,
-    # {"password":123456}, aeskey="unterminated, password=p@ssw0rd!). The value runs to the
-    # next structural delimiter (whitespace, quote, markup, list/brace separators), so the
-    # whole value is masked including punctuation, while matching stays linear and never
-    # crosses a delimiter (no over-redaction of surrounding text). A left word boundary
-    # keeps a sensitive suffix (hotkey, monkey) from matching.
+    # 7. "key":value / "key":123  (JSON, unquoted or numeric value)
     text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*["\']?)([^\s,;{}\[\]"\']+)', r'\1[REDACTED]', text)
-    # The opening marker also accepts HTML-entity or backslash-escaped quotes, so a key
-    # written as aeskey=&quot;...&quot; or aeskey=\"...\" is masked, not just the plain form.
+    # 8. key=token  (bare; optional literal/entity/escape opening quote)
     return re.sub(r'(?i)(\b' + SENSITIVE + r'\s*[:=]\s*(?:&(?:quot|apos|#34|#39);|\\?["\'])?)([^\s,;&"\'<>]+)', r'\1[REDACTED]', text)
 
 
@@ -268,7 +271,7 @@ def query_sessions(args, directory):
                     continue
                 record = conversations.setdefault(table[4:], {'conversation_id': user or table[4:], 'name': name, 'message_count': 0, 'last_message_time': 0})
                 record['message_count'] += count
-                record['last_message_time'] = max(record['last_message_time'], latest or 0)
+                record['last_message_time'] = max(record['last_message_time'], _num(latest))
     records = sorted(conversations.values(), key=lambda r: r['last_message_time'], reverse=True)
     backend.emit(success=True, app='wechat', **status, sessions=records[:args.limit], count=min(len(records), args.limit))
     return 0
@@ -279,7 +282,7 @@ def query_messages(args, directory):
     root = db_root(directory)
     names, hashes = identities(root)
     conversation = getattr(args, 'conversation_id', None)
-    chat_hash = conversation if conversation and re.fullmatch(r'[a-f0-9]{32}', conversation) else (hashlib.md5(conversation.encode()).hexdigest() if conversation else None)
+    chat_hash = conversation.lower() if conversation and re.fullmatch(r'[a-fA-F0-9]{32}', conversation) else (hashlib.md5(conversation.encode()).hexdigest() if conversation else None)
     keyword = getattr(args, 'keyword', None)
     if args.since is not None and args.until is not None and args.since > args.until:
         raise ValueError('--since 不能大于 --until')
@@ -304,7 +307,7 @@ def query_messages(args, directory):
                     filters.append('create_time<=?'); parameters.append(args.until)
                 sql = 'SELECT * FROM ' + quote(table) + (' WHERE ' + ' AND '.join(filters) if filters else '') + ' ORDER BY create_time DESC,sort_seq DESC,local_id DESC'
                 for row in conn.execute(sql, parameters):
-                    if len(heap) == args.limit and (row['create_time'] or 0) < heap[0][0]:
+                    if len(heap) == args.limit and _num(row['create_time']) < heap[0][0]:
                         break
                     text, parse_status = decode_content(row['message_content'])
                     if not text and row['compress_content']:
@@ -333,8 +336,8 @@ def query_messages(args, directory):
                         'source_db': shard.name, 'source_table': table,
                     }
                     serial += 1
-                    heapq.heappush(heap, (row['create_time'] or 0, row['sort_seq'] or 0,
-                                          row['local_id'] or 0, shard.name, table, serial, record))
+                    heapq.heappush(heap, (_num(row['create_time']), _num(row['sort_seq']),
+                                          _num(row['local_id']), shard.name, table, serial, record))
                     if len(heap) > args.limit:
                         heapq.heappop(heap)
     records = [item[-1] for item in sorted(heap, reverse=True)]

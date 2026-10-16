@@ -624,7 +624,10 @@ class WeChatTests(unittest.TestCase):
                      '<aeskey attr="1">SYNTH_SECRET</aeskey>',              # attribute in opening tag
                      '<password><![CDATA[p<a<ssSECRET]]></password>',        # < inside CDATA body
                      '<img aeskey=&quot;entSECRET&quot;/>',                  # HTML-entity-quoted attribute
-                     'aeskey=\\"escSECRET\\"'):                              # backslash-escaped quotes
+                     'aeskey=\\"escSECRET\\"',                               # backslash-escaped quotes
+                     '<aeskey><![CDATA[aKEY]]><![CDATA[bSECRET]]></aeskey>',  # multiple CDATA sections
+                     'password=&quot;alpha beta SECRET&quot;',               # entity-quoted value with spaces
+                     'password=\\"alpha beta SECRET\\"'):                    # escape-quoted value with spaces
             self.assertNotIn('SECRET', q.redact(text), text)
         # tags whose name merely starts with a sensitive word must be left intact
         for keep in ('<aeskeyring>door</aeskeyring>', '<tokenizer>x</tokenizer>'):
@@ -755,6 +758,29 @@ class WeChatTests(unittest.TestCase):
             out = Path(args.out_dir)
             self.assertTrue((out / 'db' / 'message').is_dir())
             self.assertEqual(q.db_root(out), out / 'db')  # queryable: no 缺少 db/message error
+
+    def test_non_numeric_timestamp_and_uppercase_conversation_id(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); db = root / 'db'
+            for folder in ('contact', 'session', 'message'):
+                (db / folder).mkdir(parents=True)
+            with writable(db / 'contact/contact.db') as c:
+                c.execute('CREATE TABLE contact(username,nick_name,remark)')
+            with writable(db / 'session/session.db') as c:
+                c.execute('CREATE TABLE SessionTable(username)')
+            table = 'Msg_' + hashlib.md5(b'alice').hexdigest()
+            with writable(db / 'message/message_0.db') as c:
+                c.execute('CREATE TABLE Name2Id(user_name)')
+                c.execute("INSERT INTO Name2Id VALUES('alice')")
+                c.execute('CREATE TABLE ' + table + '(local_id,server_id,real_sender_id,create_time,sort_seq,local_type,message_content,compress_content)')
+                c.execute("INSERT INTO " + table + " VALUES(1,2,1,'not-a-number',1,1,'会议甲',NULL)")  # non-numeric time
+                c.execute("INSERT INTO " + table + " VALUES(2,2,1,200,2,1,'会议乙',NULL)")
+            (root / 'snapshot_manifest.json').write_text(manifest_with_dbs(db))
+            for conv in ('alice', hashlib.md5(b'alice').hexdigest().upper()):  # username, then UPPER hash
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    q.query_messages(Namespace(conversation_id=conv, keyword=None, since=None, until=None, limit=10), root)
+                self.assertEqual(json.loads(stdout.getvalue())['count'], 2, conv)
 
 
 if __name__ == '__main__':
