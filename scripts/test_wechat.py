@@ -411,8 +411,9 @@ class WeChatTests(unittest.TestCase):
 
     def fake_snapshot_one(self, backend, source, dest, *key):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b'synthetic plaintext')
-        return {'quick_check': 'ok', 'applied_frames': 0}
+        data = b'synthetic plaintext'
+        dest.write_bytes(data)
+        return {'quick_check': 'ok', 'applied_frames': 0, 'snapshot_sha256': hashlib.sha256(data).hexdigest()}
 
     def test_snapshot_excludes_only_reserved_database_and_publishes_after_validation(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -596,14 +597,16 @@ class WeChatTests(unittest.TestCase):
         # the XML tag body (unmatched <token> run). All must stay far from the multi-second
         # blowups each construct produced before being bounded/unrolled.
         for label, blob in (('alnum', 'A1' * 60000), ('cdn', 'cdn' * 60000),
-                            ('backslash', 'aeskey="' + chr(92) * 400), ('xmltag', '<token>' * 40000)):
+                            ('backslash', 'aeskey="' + chr(92) * 400), ('xmltag', '<token>' * 40000),
+                            ('unclosedtag', '<token ' * 40000)):
             start = time.perf_counter()
             q.redact(blob)
             elapsed = time.perf_counter() - start
             self.assertLess(elapsed, 5, f'{label} redact took {elapsed:.2f}s')
 
     def test_redaction_masks_values_without_leaking_tail(self):
-        for text in ('{"password":"abc\'defSECRET"}', 'aeskey="abc\'defSECRET"',
+        for text in ('password: "alpha beta SECRET"', "token: 'q v SECRET'",  # colon + quoted value with spaces
+                     '{"password":"abc\'defSECRET"}', 'aeskey="abc\'defSECRET"',
                      "authkey='va\"lSECRET'", '{"access_token":"ab\'cdSECRET"}',
                      'aeskey="ab\\"cdSECRET"',          # escaped quote inside the value
                      'aeskey="unterminatedSECRET',      # no closing quote (attr form)
@@ -706,6 +709,17 @@ class WeChatTests(unittest.TestCase):
             table = 'Msg_' + hashlib.md5(b'alice').hexdigest()
             with writable(root / 'db/message/message_0.db') as c:  # modify content, same filename set
                 c.execute('UPDATE ' + table + " SET message_content='篡改'")
+            args = Namespace(conversation_id='alice', keyword=None, since=None, until=None, limit=10)
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'SHA-256'):
+                q.query_messages(args, root)
+
+    def test_query_rejects_snapshot_with_missing_db_hash(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.query_fixture(root / 'db', [(1, 1, '会议')])
+            manifest = json.loads((root / 'snapshot_manifest.json').read_text('utf-8'))
+            del manifest['databases'][0]['snapshot_sha256']  # a manifest without a hash is refused
+            (root / 'snapshot_manifest.json').write_text(json.dumps(manifest))
             args = Namespace(conversation_id='alice', keyword=None, since=None, until=None, limit=10)
             with redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'SHA-256'):
                 q.query_messages(args, root)
