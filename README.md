@@ -10,7 +10,7 @@ ChatCracker 是一个以本地聊天记录为基础的个人记忆与回顾工�
 
 目前支持 Windows 上的**个人微信 4.x 和企业微信**。项目的方向是用统一的读取、查询与证据结构逐步接入更多聊天来源；其他平台尚未实现。
 
-> ChatCracker 是项目的新品牌名称。当前 GitHub 仓库、Skill 标识与命令入口仍沿用 `wecomcracker`；下方安装链接和命令可按原名称使用。
+> GitHub 仓库已更名为 `chatcracker`。Skill 标识、安装目录与命令入口仍沿用 `wecomcracker`，可继续使用 `$wecomcracker` 和下方命令。
 
 ## 可以用它做什么
 
@@ -41,7 +41,7 @@ ChatCracker 是一个以本地聊天记录为基础的个人记忆与回顾工�
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex\skills" | Out-Null
 
-git clone https://github.com/kizzhang/wecomcracker.git `
+git clone https://github.com/kizzhang/chatcracker.git `
   "$env:USERPROFILE\.codex\skills\wecomcracker"
 ```
 
