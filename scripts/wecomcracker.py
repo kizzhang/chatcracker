@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -1050,10 +1051,19 @@ def _parse_message_content(raw: object) -> str:
 def _timestamp_to_utc_iso(value: object) -> Optional[str]:
     if value in (None, "", 0):
         return None
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None  # inf/nan would make the normalization loop below spin forever
     while abs(numeric) > 32_503_680_000:
         numeric /= 1000
-    return datetime.fromtimestamp(numeric, timezone.utc).isoformat()
+    try:
+        return datetime.fromtimestamp(numeric, timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        # Out-of-range or negative timestamps must not abort the whole query.
+        return None
 
 
 def _load_user_names(directory: Path) -> dict[str, str]:
@@ -1308,8 +1318,8 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(
         description=(
-            "WeComCracker：仅使用 Python 标准库和 Windows CNG 解密并查询企业微信本地 "
-            "wxSQLite3 快照。"
+            "WeComCracker：仅使用 Python 标准库和 Windows CNG 读取微信与企微本地快照。"
+            "个人微信在子命令后添加 --app wechat；默认保留企微模式。"
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1395,13 +1405,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     search_parser.set_defaults(handler=search_messages)
+    for command_parser in (discover_parser, doctor_parser, decrypt_parser,
+                           inspect_parser, sessions_parser, messages_parser, search_parser):
+        command_parser.add_argument(
+            "--app", choices=("wecom", "wechat"), default="wecom",
+            help="客户端：wecom 企业微信（默认），wechat 个人微信 4.x",
+        )
     return parser
 
 
+def _force_utf8_output() -> None:
+    """发出 UTF-8，避免在非 UTF-8 代码页（如 CP936/CP950）下，输出含 emoji 或
+    中文时 json.dumps(ensure_ascii=False) 触发 UnicodeEncodeError 中断整个命令。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+
+
 def main() -> int:
+    _force_utf8_output()
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.app == "wechat":
+            import wechat_queries
+            return int(wechat_queries.dispatch(args))
         return int(args.handler(args))
     except Exception as error:
         print(
