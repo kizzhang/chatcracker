@@ -572,17 +572,29 @@ class WeChatTests(unittest.TestCase):
                     handler(args, root)
                 json.loads(stdout.getvalue())  # valid JSON ⇒ no bytes leaked into output
 
-    def test_redaction_is_not_pathologically_slow_on_long_text(self):
-        blob = 'A1' * 60000  # 120k alnum chars, no separators: worst case for the prefix scan
-        start = time.perf_counter()
-        result = q.redact(blob)
-        self.assertLess(time.perf_counter() - start, 8)  # bounded ≈0.1s; the unbounded prefix regressed to minutes
-        self.assertEqual(result, blob)
+    def test_redaction_is_not_pathologically_slow(self):
+        # Each input targets a different quantifier: the bounded prefix (alnum run),
+        # the cdn core, and the escaped-quoted-value alternation (backslash bomb with
+        # no closing quote). All must stay far from the pre-fix multi-second blowups.
+        for label, blob in (('alnum', 'A1' * 60000), ('cdn', 'cdn' * 60000),
+                            ('backslash', 'aeskey="' + chr(92) * 400)):
+            start = time.perf_counter()
+            q.redact(blob)
+            elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 5, f'{label} redact took {elapsed:.2f}s')
 
     def test_redaction_matches_opening_quote_and_does_not_leak_value_tail(self):
         for text in ('{"password":"abc\'defSECRET"}', 'aeskey="abc\'defSECRET"',
-                     "authkey='va\"lSECRET'", '{"access_token":"ab\'cdSECRET"}'):
+                     "authkey='va\"lSECRET'", '{"access_token":"ab\'cdSECRET"}',
+                     'aeskey="ab\\"cdSECRET"', '{"password":123456789}',
+                     '{"token": 987654321}'):
             self.assertNotIn('SECRET', q.redact(text))
+            self.assertNotIn('123456789', q.redact('{"password":123456789}'))
+            self.assertNotIn('987654321', q.redact('{"token": 987654321}'))
+
+    def test_redaction_does_not_over_redact_benign_suffix_fields(self):
+        for text in ('hotkey="Ctrl+C"', 'monkey=banana123', '<turnkey>door</turnkey>'):
+            self.assertEqual(q.redact(text), text)
 
     def test_output_pipeline_handles_emoji_under_legacy_code_page(self):
         sink = io.TextIOWrapper(io.BytesIO(), encoding='cp936', errors='strict', newline='')
@@ -596,6 +608,13 @@ class WeChatTests(unittest.TestCase):
         finally:
             sys.stdout = original
         self.assertIn('👋', raw.decode('utf-8'))
+
+    def test_emit_tolerates_stray_bytes_values(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            b.emit(success=True, server_id=b'\xff\xfe', note='ok')  # bytes in a numeric field
+        data = json.loads(stdout.getvalue())  # must be valid JSON, not a TypeError
+        self.assertEqual(data['note'], 'ok')
 
 
 if __name__ == '__main__':

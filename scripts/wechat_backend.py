@@ -35,8 +35,14 @@ TZ = timezone.utc
 def now():
     return datetime.now(TZ).isoformat()
 
+def _json_default(value):
+    # Backstop so a stray bytes/BLOB in any column never aborts output with TypeError.
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode('utf-8', 'replace')
+    return repr(value)
+
 def emit(**data):
-    print(json.dumps(data, ensure_ascii=False), flush=True)
+    print(json.dumps(data, ensure_ascii=False, default=_json_default), flush=True)
 
 def verify(key, page, salt=None):
     if len(key) != 32 or len(page) != PAGE:

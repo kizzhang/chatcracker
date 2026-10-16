@@ -18,10 +18,11 @@ import wechat_backend as backend
 TYPE_NAMES = {1: '文本', 3: '图片', 34: '语音', 42: '名片', 43: '视频',
               47: '表情', 48: '位置', 49: '文件/链接/卡片', 50: '音视频通话',
               10000: '系统消息', 11000: '表情'}
-# Credential-like keyword cores. An optional ``[a-z0-9]+[_-]`` prefix (access_, cdn_,
-# file_, client_, …) may precede them, so prefixed forms such as access_token,
-# refresh_token and my_api_key are covered without matching ordinary prose words.
-_SENSITIVE_CORE = (r'(?:cdn[a-z_]*key|aeskey|authkey|filekey|file_key|session_key|encrykey|'
+# Credential-like keyword cores. An optional bounded ``[a-z0-9]{1,32}[_-]`` prefix
+# (access_, cdn_, file_, client_, …) may precede them, so prefixed forms such as
+# access_token, refresh_token and my_api_key are covered without matching ordinary
+# prose words. Every quantifier here is bounded so redact() stays linear-time.
+_SENSITIVE_CORE = (r'(?:cdn[a-z_]{0,30}key|aeskey|authkey|filekey|file_key|session_key|encrykey|'
                    r'encryptkey|appsecret|app_secret|secret|access_token|refresh_token|'
                    r'pass_ticket|token|ticket|key|password|passwd|pwd)')
 SENSITIVE = r'(?:[a-z0-9]{1,32}[_-]){0,6}' + _SENSITIVE_CORE
@@ -44,12 +45,15 @@ def username_key(value):
 
 
 def redact(text):
+    # A left word boundary keeps a sensitive suffix (hotkey, monkey) from matching.
     # Quoted values match their own opening quote as the terminator (with escape
     # handling) so a value containing the other quote cannot leak its tail.
-    text = re.sub(r'(?i)(' + SENSITIVE + r'\s*=\s*(["\']))(?:\\.|(?!\2).)*(\2)', r'\1[REDACTED]\3', text)
+    text = re.sub(r'(?i)(\b' + SENSITIVE + r'\s*=\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
     text = re.sub(r'(?is)(<' + SENSITIVE + r'>).*?(</' + SENSITIVE + r'>)', r'\1[REDACTED]\2', text)
     text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
-    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*(["\']))(?:\\.|(?!\2).)*(\2)', r'\1[REDACTED]\3', text)
+    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*(["\']))(?:\\.|(?!\2)[^\\])*(\2)', r'\1[REDACTED]\3', text)
+    # JSON value that is a bare number/keyword (unquoted), e.g. {"password":123456}.
+    text = re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*)(?!["\'])([^\s,;{}\[\]"\']+)', r'\1[REDACTED]', text)
     # Bare, unquoted assignments (token=..., access_token: ...) the patterns above miss.
     return re.sub(r'(?i)\b(' + SENSITIVE + r')(\s*[:=]\s*)([^\s,;&"\'<>]{4,})', r'\1\2[REDACTED]', text)
 
