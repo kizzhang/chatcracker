@@ -646,7 +646,8 @@ class WeChatTests(unittest.TestCase):
             q.ZSTD_MAX_OUTPUT = original
 
     def test_out_of_range_timestamp_returns_none_instead_of_raising(self):
-        for bad in (-100000, -99999999999, b'not-a-number', 'x'):
+        for bad in (-100000, -99999999999, b'not-a-number', 'x',
+                    float('inf'), float('-inf'), float('nan')):  # inf/nan must not hang the loop
             self.assertIsNone(wc._timestamp_to_utc_iso(bad))
         self.assertTrue(wc._timestamp_to_utc_iso(1700000000).startswith('20'))
 

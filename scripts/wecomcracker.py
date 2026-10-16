@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -1054,6 +1055,8 @@ def _timestamp_to_utc_iso(value: object) -> Optional[str]:
         numeric = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(numeric):
+        return None  # inf/nan would make the normalization loop below spin forever
     while abs(numeric) > 32_503_680_000:
         numeric /= 1000
     try:

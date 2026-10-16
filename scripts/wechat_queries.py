@@ -134,10 +134,17 @@ def configured_roots():
             folder = Path(base) / relative
             if not folder.is_dir():
                 continue
-            for config in folder.glob('*'):
-                if not config.is_file() or config.stat().st_size > 65536:
-                    continue
-                raw = config.read_bytes()
+            try:
+                entries = list(folder.glob('*'))
+            except OSError:
+                continue
+            for config in entries:
+                try:
+                    if not config.is_file() or config.stat().st_size > 65536:
+                        continue
+                    raw = config.read_bytes()
+                except OSError:
+                    continue  # a config file locked or removed mid-scan must not abort discovery
                 for encoding in ('utf-8-sig', 'utf-16', 'gbk'):
                     try:
                         text = raw.decode(encoding).strip().strip('\x00')
@@ -148,7 +155,7 @@ def configured_roots():
                     except ValueError:
                         obj = None
                     if isinstance(obj, dict):
-                        roots.extend(Path(obj[k]) for k in ('dataDir', 'fileSavePath', 'savePath', 'path') if isinstance(obj.get(k), str))
+                        roots.extend(Path(obj[k]) for k in ('dataDir', 'fileSavePath', 'savePath', 'path') if isinstance(obj.get(k), str) and obj.get(k))
                     for line in text.splitlines():
                         match = re.search(r'(?:^|=)\s*["\']?([A-Za-z]:[\\/][^\x00\r\n"\']+)', line)
                         if match:
