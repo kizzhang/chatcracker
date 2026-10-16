@@ -1,0 +1,272 @@
+"""Personal WeChat discovery and immutable snapshot queries (standard library)."""
+from __future__ import annotations
+
+from contextlib import closing
+import hashlib
+import heapq
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import sqlite3
+import struct
+import winreg
+
+import wechat_backend as backend
+
+TYPE_NAMES = {1: '文本', 3: '图片', 34: '语音', 42: '名片', 43: '视频',
+              47: '表情', 48: '位置', 49: '文件/链接/卡片', 50: '音视频通话',
+              10000: '系统消息', 11000: '表情'}
+SENSITIVE = r'(?:aeskey|authkey|filekey|file_key|cdn[a-z_]*key|token|ticket|pass_ticket|session_key|encrykey)'
+
+
+def redact(text):
+    text = re.sub(r'(?i)(' + SENSITIVE + r'\s*=\s*["\'])[^"\']*(["\'])', r'\1[REDACTED]\2', text)
+    text = re.sub(r'(?is)(<' + SENSITIVE + r'>).*?(</' + SENSITIVE + r'>)', r'\1[REDACTED]\2', text)
+    text = re.sub(r'(?i)([?&](?:amp;)?' + SENSITIVE + r'=)[^&\s<>"\']+', r'\1[REDACTED]', text)
+    return re.sub(r'(?i)(["\']' + SENSITIVE + r'["\']\s*:\s*["\'])[^"\']*(["\'])', r'\1[REDACTED]\2', text)
+
+
+def decode_content(value):
+    if value is None or value == '' or value == b'':
+        return '', 'empty'
+    if isinstance(value, str):
+        return redact(value), 'utf8'
+    if not isinstance(value, bytes):
+        return '', 'unsupported_value'
+    status = 'utf8'
+    if value.startswith(b'\x28\xb5\x2f\xfd'):
+        try:
+            from compression import zstd
+        except ImportError as error:
+            raise RuntimeError('个人微信压缩消息需要 Python 3.14 的 compression.zstd') from error
+        try:
+            value = zstd.decompress(value)
+            status = 'zstd'
+        except Exception:
+            return '', 'zstd_unresolved'
+    try:
+        return redact(value.decode('utf-8')), status
+    except UnicodeDecodeError:
+        return '', 'binary_unresolved'
+
+
+def quote(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def is_account_db(path):
+    return (path / 'contact/contact.db').is_file() and (path / 'session/session.db').is_file() and (path / 'message').is_dir()
+
+
+def configured_roots():
+    roots = [Path.home() / 'Documents', Path.home()]
+    for subkey in (r'Software\Tencent\WeChat', r'Software\Tencent\Weixin', r'Software\Tencent\xwechat'):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey) as key:
+                for name in ('FileSavePath', 'DataPath', 'DataDir'):
+                    try:
+                        value, _ = winreg.QueryValueEx(key, name)
+                        if isinstance(value, str) and value:
+                            roots.append(Path(value))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    for env in ('APPDATA', 'LOCALAPPDATA'):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        for relative in ('Tencent/xwechat', 'Tencent/xwechat/config', 'Tencent/WeChat/All Users/config'):
+            folder = Path(base) / relative
+            if not folder.is_dir():
+                continue
+            for config in folder.glob('*'):
+                if not config.is_file() or config.stat().st_size > 65536:
+                    continue
+                raw = config.read_bytes()
+                for encoding in ('utf-8-sig', 'utf-16', 'gbk'):
+                    try:
+                        text = raw.decode(encoding).strip().strip('\x00')
+                    except UnicodeError:
+                        continue
+                    try:
+                        obj = json.loads(text)
+                    except ValueError:
+                        obj = None
+                    if isinstance(obj, dict):
+                        roots.extend(Path(obj[k]) for k in ('dataDir', 'fileSavePath', 'savePath', 'path') if isinstance(obj.get(k), str))
+                    for line in text.splitlines():
+                        match = re.search(r'(?:^|=)\s*["\']?([A-Za-z]:[\\/][^\x00\r\n"\']+)', line)
+                        if match:
+                            roots.append(Path(match.group(1).strip()))
+    return roots
+
+
+def discover(data_root=None):
+    found = set()
+    for root in ([Path(data_root)] if data_root else configured_roots()):
+        for parent in (root, root / 'xwechat_files'):
+            if not parent.is_dir():
+                continue
+            if is_account_db(parent):
+                found.add(parent.resolve())
+            if is_account_db(parent / 'db_storage'):
+                found.add((parent / 'db_storage').resolve())
+            for account in parent.iterdir():
+                if account.is_dir() and is_account_db(account / 'db_storage'):
+                    found.add((account / 'db_storage').resolve())
+    return sorted(found)
+
+
+def snapshot_status(directory):
+    path = directory / 'snapshot_manifest.json'
+    if not path.is_file():
+        raise ValueError('缺少 snapshot_manifest.json；请先创建经过校验的个人微信快照')
+    manifest = json.loads(path.read_text('utf-8'))
+    if manifest.get('format') != 'wechat-local-snapshot-v1' or not manifest.get('success') or manifest.get('failed'):
+        raise ValueError('拒绝查询失败或不匹配的个人微信快照')
+    return {key: manifest.get(key) for key in ('complete', 'wal_processed', 'finished_at', 'cross_database_atomic')}
+
+
+def db_root(directory):
+    root = directory / 'db'
+    if not is_account_db(root):
+        raise ValueError('个人微信快照缺少 db/contact、db/session 或 db/message')
+    return root
+
+
+def shards(root):
+    return sorted(path for path in (root / 'message').glob('*.db') if re.fullmatch(r'(?:message|biz_message)_\d+\.db', path.name))
+
+
+def identities(root):
+    names, users = {}, set()
+    with closing(backend.ro_open(root / 'contact/contact.db')) as conn:
+        for user, nick, remark in conn.execute('SELECT username,nick_name,remark FROM contact'):
+            if user:
+                names[user] = remark or nick or user
+                users.add(user)
+    with closing(backend.ro_open(root / 'session/session.db')) as conn:
+        users.update(row[0] for row in conn.execute('SELECT username FROM SessionTable') if row[0])
+    for shard in shards(root):
+        with closing(backend.ro_open(shard)) as conn:
+            users.update(row[0] for row in conn.execute('SELECT user_name FROM Name2Id') if row[0])
+    return names, {hashlib.md5(user.encode()).hexdigest(): user for user in users}
+
+
+def query_sessions(args, directory):
+    status = snapshot_status(directory)
+    root = db_root(directory)
+    names, hashes = identities(root)
+    conversations = {}
+    for shard in shards(root):
+        with closing(backend.ro_open(shard)) as conn:
+            for table, in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'Msg_*'").fetchall():
+                if not re.fullmatch(r'Msg_[0-9a-f]{32}', table):
+                    continue
+                count, latest = conn.execute('SELECT count(*),max(create_time) FROM ' + quote(table)).fetchone()
+                user = hashes.get(table[4:], '')
+                name = names.get(user, user) or table[4:]
+                if args.keyword and args.keyword.casefold() not in (name + ' ' + user).casefold():
+                    continue
+                record = conversations.setdefault(table[4:], {'conversation_id': user or table[4:], 'name': name, 'message_count': 0, 'last_message_time': 0})
+                record['message_count'] += count
+                record['last_message_time'] = max(record['last_message_time'], latest or 0)
+    records = sorted(conversations.values(), key=lambda r: r['last_message_time'], reverse=True)
+    backend.emit(success=True, app='wechat', **status, sessions=records[:args.limit], count=min(len(records), args.limit))
+    return 0
+
+
+def query_messages(args, directory):
+    status = snapshot_status(directory)
+    root = db_root(directory)
+    names, hashes = identities(root)
+    conversation = getattr(args, 'conversation_id', None)
+    chat_hash = conversation if conversation and re.fullmatch(r'[a-f0-9]{32}', conversation) else (hashlib.md5(conversation.encode()).hexdigest() if conversation else None)
+    keyword = getattr(args, 'keyword', None)
+    if args.since is not None and args.until is not None and args.since > args.until:
+        raise ValueError('--since 不能大于 --until')
+    heap = []
+    unresolved = 0
+    serial = 0
+    for shard in shards(root):
+        with closing(backend.ro_open(shard)) as conn:
+            conn.row_factory = sqlite3.Row
+            sender_map = {row[0]: row[1] for row in conn.execute('SELECT rowid,user_name FROM Name2Id')}
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'Msg_*'") if re.fullmatch(r'Msg_[a-f0-9]{32}', r[0])]
+            for table in tables:
+                if chat_hash and table[4:] != chat_hash:
+                    continue
+                filters, parameters = [], []
+                lower_bound = args.since
+                if len(heap) == args.limit:
+                    lower_bound = max(lower_bound or 0, heap[0][0])
+                if lower_bound is not None:
+                    filters.append('create_time>=?'); parameters.append(lower_bound)
+                if args.until is not None:
+                    filters.append('create_time<=?'); parameters.append(args.until)
+                sql = 'SELECT * FROM ' + quote(table) + (' WHERE ' + ' AND '.join(filters) if filters else '') + ' ORDER BY create_time DESC,local_id DESC'
+                for row in conn.execute(sql, parameters):
+                    if len(heap) == args.limit and (row['create_time'] or 0) < heap[0][0]:
+                        break
+                    text, parse_status = decode_content(row['message_content'])
+                    if not text and row['compress_content']:
+                        fallback, fallback_status = decode_content(row['compress_content'])
+                        if fallback:
+                            text, parse_status = fallback, 'compress_content:' + fallback_status
+                    if 'unresolved' in parse_status:
+                        unresolved += 1
+                    if keyword and keyword.casefold() not in text.casefold():
+                        continue
+                    user = hashes.get(table[4:], '')
+                    sender = sender_map.get(row['real_sender_id'], '')
+                    record = {
+                        'message_id': f'{shard.name}:{table}:{row["local_id"]}',
+                        'local_id': row['local_id'], 'server_id': row['server_id'],
+                        'conversation_id': user or table[4:], 'conversation_name': names.get(user, user),
+                        'sender_id': sender, 'sender_name': names.get(sender, sender),
+                        'send_time': row['create_time'], 'send_time_iso_utc': backend.wc._timestamp_to_utc_iso(row['create_time']),
+                        'sequence': row['sort_seq'], 'content_type': row['local_type'],
+                        'type_name': TYPE_NAMES.get(row['local_type'] & 0xffffffff, str(row['local_type'])),
+                        'text': text, 'parse_status': parse_status,
+                        'source_db': shard.name, 'source_table': table,
+                    }
+                    serial += 1
+                    heapq.heappush(heap, (row['create_time'] or 0, serial, record))
+                    if len(heap) > args.limit:
+                        heapq.heappop(heap)
+    records = [item[2] for item in sorted(heap, reverse=True)]
+    backend.emit(success=True, app='wechat', **status, messages=records, count=len(records), scanned_unresolved_messages=unresolved)
+    return 0
+
+
+def dispatch(args):
+    if args.command in ('discover', 'doctor'):
+        accounts = discover(args.data_root)
+        sources = [{'db_dir': str(p), 'account': p.parent.name, 'database_count': len(list(p.rglob('*.db')))} for p in accounts]
+        if args.command == 'discover':
+            backend.emit(success=True, app='wechat', count=len(sources), sources=sources)
+        else:
+            try:
+                from compression import zstd
+                zstd_available = True
+            except ImportError:
+                zstd_available = False
+            with backend.wc.WindowsAesCbc() as aes:
+                backend.cng256_test(aes)
+            backend.emit(success=True, app='wechat', windows=platform.platform(), python=platform.python_version(), python_64_bit=struct.calcsize('P') == 8, stdlib_zstd=zstd_available, cng_aes256_self_test='ok', same_session_weixin_process_count=len(backend.pids()), sources=sources)
+        return 0
+    if args.command == 'decrypt':
+        return backend.snapshot(args)
+    directory = Path(args.decrypted_dir).resolve()
+    if args.command == 'sessions':
+        return query_sessions(args, directory)
+    if args.command in ('messages', 'search'):
+        return query_messages(args, directory)
+    status = snapshot_status(directory)
+    root = db_root(directory)
+    manifest = json.loads((directory / 'snapshot_manifest.json').read_text('utf-8'))
+    backend.emit(success=True, app='wechat', **status, databases=[{'relative_path': item['relative_path'], 'quick_check': item.get('quick_check'), 'quick_check_scope': item.get('quick_check_scope'), 'bytes': (root / item['relative_path']).stat().st_size} for item in manifest['databases']])
+    return 0
